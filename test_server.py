@@ -4461,6 +4461,161 @@ class TestCloudEditNotebook:
         assert added["page_index"] == 2
         assert added["total_pages"] == 2
 
+    def _seed_with_ink(self, store):
+        doc_id, page_id = self._seed(store)
+        self._run(
+            store,
+            lambda: self._client().append_page_strokes(doc_id, page_id, [_STROKE_A, _STROKE_B]),
+        )
+        store.put_names.clear()
+        store.committed_hashes.clear()
+        return doc_id, page_id
+
+    def _page_text(self, store, doc_id, page_id, tmp_path):
+        from remarkable_mcp.extract import extract_text_from_rm_file
+
+        path = tmp_path / "page.rm"
+        path.write_bytes(store.doc_blobs(doc_id)[f"{doc_id}/{page_id}.rm"])
+        return extract_text_from_rm_file(path)
+
+    @pytest.mark.parametrize(
+        "region, remaining",
+        [(None, 0), ([0.0, 0.0, 1.0, 0.3], 1)],
+        ids=["whole-page", "region"],
+    )
+    def test_erase_rewrites_the_page_blob_only(self, region, remaining):
+        store = _FakeSyncStore()
+        doc_id, page_id = self._seed_with_ink(store)
+        before = store.doc_blobs(doc_id)
+
+        erased = self._run(
+            store, lambda: self._client().erase_page_strokes(doc_id, page_id, region)
+        )
+        after = store.doc_blobs(doc_id)
+
+        assert erased == {"erased": 2 - remaining}
+        assert sorted(store.put_names) == sorted(
+            [f"{doc_id}/{page_id}.rm", f"{doc_id}.docSchema", "root.docSchema"]
+        )
+        assert len(_page_lines(after[f"{doc_id}/{page_id}.rm"])) == remaining
+        assert after[f"{doc_id}.content"] == before[f"{doc_id}.content"]
+        assert after[f"{doc_id}.metadata"] == before[f"{doc_id}.metadata"]
+
+    @pytest.mark.parametrize("seed", ["no_match", "no_blob"])
+    def test_erase_with_nothing_to_erase_keeps_the_page(self, seed):
+        store = _FakeSyncStore()
+        if seed == "no_blob":
+            doc_id, page_id = self._seed_without_page_blob(store)
+            region = None
+        else:
+            doc_id, page_id = self._seed_with_ink(store)
+            region = [0.9, 0.0, 1.0, 0.05]
+        before = store.doc_blobs(doc_id)
+
+        erased = self._run(
+            store, lambda: self._client().erase_page_strokes(doc_id, page_id, region)
+        )
+
+        assert erased == {"erased": 0}
+        assert store.doc_blobs(doc_id) == before
+        assert not any(name.endswith(".rm") for name in store.put_names)
+
+    def test_set_text_replaces_text_and_keeps_ink(self, tmp_path):
+        store = _FakeSyncStore()
+        doc_id, page_id = self._seed_with_ink(store)
+        before = store.doc_blobs(doc_id)
+
+        result = self._run(
+            store, lambda: self._client().set_page_text(doc_id, page_id, "# Plan\n- Ship")
+        )
+        after = store.doc_blobs(doc_id)
+
+        assert result == {"created_page": False}
+        assert self._page_text(store, doc_id, page_id, tmp_path) == ["Plan", "Ship"]
+        assert len(_page_lines(after[f"{doc_id}/{page_id}.rm"])) == 2
+        assert after[f"{doc_id}.content"] == before[f"{doc_id}.content"]
+
+    def test_set_text_seeds_a_page_without_blob(self, tmp_path):
+        store = _FakeSyncStore()
+        doc_id, page_id = self._seed_without_page_blob(store)
+
+        result = self._run(store, lambda: self._client().set_page_text(doc_id, page_id, "Hi"))
+
+        assert result == {"created_page": True}
+        assert self._page_text(store, doc_id, page_id, tmp_path) == ["Hi"]
+
+    def test_set_text_rejects_non_notebook_before_upload(self):
+        from remarkable_mcp.sync import NotANotebookError
+
+        store = _FakeSyncStore()
+        client = self._client()
+        doc_id = "pdf-doc"
+
+        def create():
+            content = {"fileType": "pdf", "cPages": {"pages": [{"id": "p1"}]}}
+            files = [
+                client._upload_file_blob(json.dumps(content).encode(), f"{doc_id}.content"),
+                client._upload_file_blob(b"{}", f"{doc_id}.metadata"),
+            ]
+            client._add_new_document(doc_id, files, "Paper", "DocumentType", "")
+
+        self._run(store, create)
+        store.put_names.clear()
+        store.committed_hashes.clear()
+
+        with pytest.raises(NotANotebookError, match="not a native notebook"):
+            self._run(store, lambda: client.set_page_text(doc_id, "p1", "x"))
+        assert store.committed_hashes == []
+        assert store.put_names == []
+
+    def test_set_text_on_page_missing_from_content_aborts(self):
+        from remarkable_mcp.sync import CloudWriteError
+
+        store = _FakeSyncStore()
+        doc_id, _ = self._seed(store)
+
+        with pytest.raises(CloudWriteError, match="no longer"):
+            self._run(store, lambda: self._client().set_page_text(doc_id, "gone", "x"))
+        assert store.committed_hashes == []
+
+    def test_lost_ack_replay_sets_text_once(self):
+        import io
+
+        from rmscene import read_blocks
+        from rmscene.scene_stream import RootTextBlock
+
+        store = _FakeSyncStore()
+        doc_id, page_id = self._seed(store)
+        store.lost_acks = 1
+
+        self._run(store, lambda: self._client().set_page_text(doc_id, page_id, "New"))
+
+        assert len(store.committed_hashes) == 2
+        page = store.doc_blobs(doc_id)[f"{doc_id}/{page_id}.rm"]
+        text = next(b for b in read_blocks(io.BytesIO(page)) if isinstance(b, RootTextBlock))
+        live = [i.value for i in text.value.items.sequence_items() if i.value]
+        assert live == ["New"]
+
+    @pytest.mark.parametrize("ours", ["erase", "set_text"])
+    def test_conflict_rebuilds_page_edit_on_the_winning_root(self, ours, tmp_path):
+        store = _FakeSyncStore()
+        doc_id, page_id = self._seed(store)
+        store.conflicts = 1
+        store.interleave = self._other_writer(store, doc_id, page_id, "draw")
+        client = self._client()
+
+        if ours == "erase":
+            self._run(store, lambda: client.erase_page_strokes(doc_id, page_id))
+        else:
+            self._run(store, lambda: client.set_page_text(doc_id, page_id, "Mine"))
+
+        lines = _page_lines(store.doc_blobs(doc_id)[f"{doc_id}/{page_id}.rm"])
+        if ours == "erase":
+            assert lines == []
+        else:
+            assert [line.tool.name for _, line in lines] == ["HIGHLIGHTER_2"]
+            assert self._page_text(store, doc_id, page_id, tmp_path) == ["Mine"]
+
 
 class TestCloudAuthorDispatch:
     """remarkable_author routing on the cloud transport."""
@@ -4481,6 +4636,8 @@ class TestCloudAuthorDispatch:
                 "download_raw_file",
                 "add_notebook_page",
                 "append_page_strokes",
+                "erase_page_strokes",
+                "set_page_text",
             ]
         )
         client.get_meta_items.return_value = list(collection)
@@ -4497,6 +4654,8 @@ class TestCloudAuthorDispatch:
             "created_overlay": False,
             "paper_size": [1620, 2160],
         }
+        client.erase_page_strokes.return_value = {"erased": 3}
+        client.set_page_text.return_value = {"created_page": False}
         return client
 
     def _notebook(self):
@@ -4636,11 +4795,75 @@ class TestCloudAuthorDispatch:
         assert data["refresh_pending"] is False
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("region", [None, [0.0, 0.0, 0.5, 0.5]])
+    async def test_erase_uses_cloud_client(self, region):
+        client = self._cloud_client([self._notebook()])
+        arguments = {"method": "erase", "document": "Notes", "page": 2}
+        if region is not None:
+            arguments["region"] = region
+
+        data = await self._author(client, arguments)
+
+        client.erase_page_strokes.assert_called_once_with("doc-1", "p2", region)
+        assert data["erased"] == 3
+        assert data["document"] == "Notes"
+        assert data["page"] == 2
+        assert data["total_pages"] == 2
+        assert data["transport"] == "cloud"
+        assert data["refresh_pending"] is False
+        assert "Erased 3 stroke(s)" in data["_hint"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("text, verb", [("# Plan", "Replaced"), ("", "Removed")])
+    async def test_set_text_uses_cloud_client(self, text, verb):
+        client = self._cloud_client([self._notebook()])
+
+        data = await self._author(
+            client, {"method": "set_text", "document": "Notes", "page": 1, "text": text}
+        )
+
+        client.set_page_text.assert_called_once_with("doc-1", "p1", text)
+        assert data["created_page"] is False
+        assert data["page"] == 1
+        assert data["transport"] == "cloud"
+        assert data["_hint"].startswith(f"{verb} the typed text of page 1")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            {"method": "erase", "document": "Notes"},
+            {"method": "erase", "page": 1},
+            {"method": "set_text", "document": "Notes", "page": 1},
+            {"method": "set_text", "document": "Notes", "text": "x"},
+        ],
+        ids=["erase-no-page", "erase-no-document", "set-text-no-text", "set-text-no-page"],
+    )
+    async def test_page_edit_missing_parameter(self, arguments):
+        client = self._cloud_client([self._notebook()])
+
+        data = await self._author(client, arguments)
+
+        assert data["_error"]["type"] == "missing_parameter"
+        client.erase_page_strokes.assert_not_called()
+        client.set_page_text.assert_not_called()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "arguments, content, error_type",
         [
             (
                 {"method": "draw", "document": "Notes", "page": 3, "strokes": [_STROKE_A]},
+                None,
+                "page_out_of_range",
+            ),
+            (
+                {"method": "erase", "document": "Notes", "page": 3},
+                None,
+                "page_out_of_range",
+            ),
+            (
+                {"method": "set_text", "document": "Notes", "page": 0, "text": "x"},
                 None,
                 "page_out_of_range",
             ),
@@ -4655,7 +4878,13 @@ class TestCloudAuthorDispatch:
                 "document_not_found",
             ),
         ],
-        ids=["page-out-of-range", "no-pages", "unknown-document"],
+        ids=[
+            "page-out-of-range",
+            "erase-page-out-of-range",
+            "set-text-page-zero",
+            "no-pages",
+            "unknown-document",
+        ],
     )
     async def test_page_method_rejected_before_write(self, arguments, content, error_type):
         client = self._cloud_client([self._notebook()])
@@ -4667,6 +4896,8 @@ class TestCloudAuthorDispatch:
         assert data["_error"]["type"] == error_type
         client.add_notebook_page.assert_not_called()
         client.append_page_strokes.assert_not_called()
+        client.erase_page_strokes.assert_not_called()
+        client.set_page_text.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -4708,16 +4939,42 @@ class TestCloudAuthorDispatch:
                 "stroke_error",
                 "stroke_write_failed",
             ),
+            (
+                {"method": "erase", "document": "Notes", "page": 1},
+                "erase_page_strokes",
+                "page_edit_error",
+                "page_edit_failed",
+            ),
+            (
+                {"method": "erase", "document": "Notes", "page": 1},
+                "erase_page_strokes",
+                "http_error",
+                "page_edit_failed",
+            ),
+            (
+                {"method": "set_text", "document": "Notes", "page": 1, "text": "x"},
+                "set_page_text",
+                "not_a_notebook",
+                "not_a_notebook",
+            ),
+            (
+                {"method": "set_text", "document": "Notes", "page": 1, "text": "x"},
+                "set_page_text",
+                "cloud_write_error",
+                "page_edit_failed",
+            ),
         ],
     )
     async def test_page_method_write_error_is_structured(
         self, arguments, client_method, error, error_type
     ):
+        from remarkable_mcp.page_edit import PageEditError
         from remarkable_mcp.strokes import StrokeError
         from remarkable_mcp.sync import CloudWriteError, NotANotebookError
 
         client = self._cloud_client([self._notebook()])
         getattr(client, client_method).side_effect = {
+            "page_edit_error": PageEditError("Page p1 is gone."),
             "cloud_write_error": CloudWriteError("Page p1 is gone."),
             "http_error": requests.HTTPError("Page p1 is gone."),
             "stroke_error": StrokeError("Page p1 is gone."),
@@ -8047,6 +8304,136 @@ class TestCanvasWrite:
             result = await _call_tool("remarkable_author", {"method": "create_document"})
             data = json.loads(result.content[0].text)
             assert data["_error"]["type"] == "missing_parameter"
+
+
+class TestSSHPageEdit:
+    """remarkable_author erase and set_text over SSH."""
+
+    def _client(self, file_type="notebook", page_bytes=None):
+        doc = Mock()
+        doc.VissibleName = "Sketchbook"
+        doc.ID = "doc-abc"
+        doc.Parent = ""
+        doc.is_folder = False
+        content = json.dumps({"cPages": {"pages": [{"id": "page-1"}]}, "fileType": file_type})
+
+        def fake_scp(path):
+            if path.endswith(".content"):
+                return content.encode()
+            if path.endswith("/page-1.rm"):
+                return page_bytes
+            return None
+
+        client = Mock(spec=["get_meta_items", "_scp_download", "_ssh_command"])
+        client.get_meta_items.return_value = [doc]
+        client._scp_download.side_effect = fake_scp
+        client._ssh_command.return_value = "no"  # no .bak yet
+        return client
+
+    async def _author(self, client, arguments):
+        import remarkable_mcp.write_tools as wt
+
+        writes = {}
+        with (
+            patch.dict(os.environ, {"REMARKABLE_USE_SSH": "1"}),
+            patch.object(wt, "get_rmapi", lambda: client),
+            patch.object(wt, "_write_remote_bytes", lambda ssh, p, d: writes.__setitem__(p, d)),
+            patch.object(wt, "_restart_xochitl") as restart,
+        ):
+            result = await _call_tool("remarkable_author", arguments)
+        return json.loads(result.content[0].text), writes, restart
+
+    def _inked_page(self):
+        from remarkable_mcp import notebooks as nb
+        from remarkable_mcp import strokes as strokes_mod
+
+        return strokes_mod.append_strokes(nb.page_rm_bytes("Agenda"), [_STROKE_A, _STROKE_B])
+
+    @pytest.mark.asyncio
+    async def test_erase_backs_up_and_rewrites_the_page(self):
+        import remarkable_mcp.write_tools as wt
+
+        original = self._inked_page()
+        client = self._client(page_bytes=original)
+
+        data, writes, restart = await self._author(
+            client,
+            {"method": "erase", "document": "Sketchbook", "page": 1, "region": [0, 0, 1, 0.3]},
+        )
+
+        rm = f"{wt.XOCHITL_PATH}/doc-abc/page-1.rm"
+        assert data["erased"] == 1
+        assert data["transport"] == "ssh"
+        assert data["refresh_pending"] is False
+        assert writes[rm + ".bak"] == original
+        assert len(_page_lines(writes[rm])) == 1
+        restart.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_erase_without_match_writes_nothing(self):
+        client = self._client(page_bytes=self._inked_page())
+
+        data, writes, restart = await self._author(
+            client,
+            {"method": "erase", "document": "Sketchbook", "page": 1, "region": [0.9, 0, 1, 0.01]},
+        )
+
+        assert data["erased"] == 0
+        assert data["refresh_pending"] is False
+        assert "unchanged" in data["_hint"]
+        assert writes == {}
+        restart.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("defer_restart", [False, True])
+    async def test_set_text_seeds_a_missing_page(self, defer_restart, tmp_path):
+        import remarkable_mcp.write_tools as wt
+        from remarkable_mcp.extract import extract_text_from_rm_file
+
+        client = self._client(page_bytes=None)
+
+        data, writes, restart = await self._author(
+            client,
+            {
+                "method": "set_text",
+                "document": "Sketchbook",
+                "page": 1,
+                "text": "# Plan",
+                "defer_restart": defer_restart,
+            },
+        )
+
+        rm = f"{wt.XOCHITL_PATH}/doc-abc/page-1.rm"
+        assert data["created_page"] is True
+        assert data["refresh_pending"] is defer_restart
+        assert list(writes) == [rm]
+        path = tmp_path / "page.rm"
+        path.write_bytes(writes[rm])
+        assert extract_text_from_rm_file(path) == ["Plan"]
+        assert restart.called is not defer_restart
+
+    @pytest.mark.asyncio
+    async def test_set_text_on_pdf_is_refused(self):
+        client = self._client(file_type="pdf", page_bytes=self._inked_page())
+
+        data, writes, restart = await self._author(
+            client, {"method": "set_text", "document": "Sketchbook", "page": 1, "text": "x"}
+        )
+
+        assert data["_error"]["type"] == "not_a_notebook"
+        assert writes == {}
+        restart.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unreadable_page_is_structured(self):
+        client = self._client(page_bytes=b"not a page")
+
+        data, writes, _ = await self._author(
+            client, {"method": "erase", "document": "Sketchbook", "page": 1}
+        )
+
+        assert data["_error"]["type"] == "page_edit_failed"
+        assert writes == {}
 
 
 class TestNotebookBuilders:

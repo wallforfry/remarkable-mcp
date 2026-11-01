@@ -443,6 +443,7 @@ def _validate_author_request(
     page: Optional[int],
     strokes: Optional[list],
     name: Optional[str],
+    text: Optional[str],
 ) -> Optional[str]:
     """Return transport-free validation errors before resolving an SSH client."""
     if method == "draw":
@@ -473,6 +474,25 @@ def _validate_author_request(
                 suggestion='Call remarkable_author(method="add_page", document=...).',
             )
         return None
+    if method == "erase":
+        if not document or page is None:
+            return make_error(
+                error_type="missing_parameter",
+                message="erase requires 'document' and 'page'.",
+                suggestion='Call remarkable_author(method="erase", document=..., page=1).',
+            )
+        return None
+    if method == "set_text":
+        if not document or page is None or text is None:
+            return make_error(
+                error_type="missing_parameter",
+                message="set_text requires 'document', 'page' and 'text'.",
+                suggestion=(
+                    'Call remarkable_author(method="set_text", document=..., page=1, '
+                    'text="..."); pass text="" to remove the typed text.'
+                ),
+            )
+        return None
     if method == "create_document":
         if not name:
             return make_error(
@@ -484,8 +504,8 @@ def _validate_author_request(
     return make_error(
         error_type="unknown_method",
         message=f"Unknown method: '{method}'.",
-        suggestion='Use method="draw", "add_page", or "create_document".',
-        did_you_mean=["draw", "add_page", "create_document"],
+        suggestion='Use method="draw", "erase", "set_text", "add_page", or "create_document".',
+        did_you_mean=["draw", "erase", "set_text", "add_page", "create_document"],
     )
 
 
@@ -1221,8 +1241,8 @@ def _not_a_notebook_error(error: Exception) -> str:
         error_type="not_a_notebook",
         message=str(error),
         suggestion=(
-            "Pages can only be added to native notebooks. PDF/EPUB pages "
-            "already exist; open the page and draw on it directly."
+            "Only native notebooks take new pages or typed text. PDF/EPUB "
+            "pages already exist; draw on them or erase their ink directly."
         ),
     )
 
@@ -1613,6 +1633,204 @@ def _cloud_author_add_page(client, document: str) -> str:
     )
 
 
+def _page_edit_error(error: Exception, page: int, doc_name: str) -> str:
+    return make_error(
+        error_type="page_edit_failed",
+        message=f"Failed to edit page {page} of '{doc_name}': {error}",
+        suggestion="Use remarkable_canvas(document, page) to check the page, then retry.",
+    )
+
+
+def _erase_hint(erased: int, page: int, doc_name: str, region: Optional[list]) -> str:
+    scope = "inside the region" if region is not None else "on the page"
+    if not erased:
+        return f"No stroke {scope}; page {page} of '{doc_name}' is unchanged."
+    return f"Erased {erased} stroke(s) {scope} from page {page} of '{doc_name}'."
+
+
+def _text_hint(text: str, page: int, doc_name: str) -> str:
+    if text:
+        return f"Replaced the typed text of page {page} of '{doc_name}'."
+    return f"Removed the typed text of page {page} of '{doc_name}'."
+
+
+def _ssh_edit_page(
+    document: str,
+    page: int,
+    defer_restart: bool,
+    rewrite,
+    *,
+    notebook_only: bool,
+) -> tuple:
+    """Rewrite one page over SSH; return ``(response_fields, None)`` or ``(None, error)``.
+
+    ``rewrite(original, content_data)`` returns ``(new_bytes, fields)``, with
+    ``new_bytes`` None to leave the page alone. The pristine page is backed up
+    to ``{pageId}.rm.bak`` once, as ``draw`` does. ``refresh_pending`` in the
+    fields is true only when a write left its restart deferred.
+    """
+    from remarkable_mcp.page_edit import PageEditError
+
+    ssh_client = _get_ssh_client()
+    target, error = _find_author_target(ssh_client, document)
+    if error:
+        return None, error
+
+    doc_uuid = target.ID
+    content_raw = _read_remote_bytes(ssh_client, f"{XOCHITL_PATH}/{doc_uuid}.content")
+    content_data = _parse_content(content_raw)
+    page_ids, error = _draw_page_ids(content_data, page, target.VissibleName)
+    if error:
+        return None, error
+    if notebook_only and content_data.get("fileType") != "notebook":
+        return None, _not_a_notebook_error(
+            ValueError(f"'{target.VissibleName}' is not a native notebook.")
+        )
+
+    rm_path = f"{XOCHITL_PATH}/{doc_uuid}/{page_ids[page - 1]}.rm"
+    original = _read_remote_bytes(ssh_client, rm_path)
+    try:
+        new_bytes, fields = rewrite(original, content_data)
+    except PageEditError as e:
+        return None, _page_edit_error(e, page, target.VissibleName)
+
+    fields["refresh_pending"] = False
+    if new_bytes is not None and new_bytes != original:
+        if original is not None:
+            bak_path = rm_path + ".bak"
+            if not _remote_file_exists(ssh_client, bak_path):
+                _write_remote_bytes(ssh_client, bak_path, original)
+        _write_remote_bytes(ssh_client, rm_path, new_bytes)
+        restarted = _maybe_restart_xochitl(ssh_client, defer_restart)
+        _update_deferred_ssh_cache(ssh_client, restarted)
+        _clear_document_extraction_cache(doc_uuid)
+        fields["refresh_pending"] = not restarted
+    fields.update(
+        document=target.VissibleName,
+        page=page,
+        total_pages=len(page_ids),
+        transport="ssh",
+    )
+    return fields, None
+
+
+def _author_erase(
+    document: str, page: int, region: Optional[list], defer_restart: bool = False
+) -> str:
+    """Erase strokes from a page over SSH, all of them or those crossing ``region``."""
+    from remarkable_mcp import page_edit
+
+    def rewrite(original, _content):
+        if original is None:
+            return None, {"erased": 0}
+        new_bytes, erased = page_edit.erase_strokes(original, region)
+        return new_bytes, {"erased": erased}
+
+    fields, error = _ssh_edit_page(document, page, defer_restart, rewrite, notebook_only=False)
+    if error:
+        return error
+    hint = _write_result_message(
+        not fields["refresh_pending"],
+        _erase_hint(fields["erased"], page, fields["document"], region),
+        "Call remarkable_canvas(document, page) to view the updated page.",
+    )
+    return make_response(fields, hint)
+
+
+def _author_set_text(document: str, page: int, text: str, defer_restart: bool = False) -> str:
+    """Replace the typed text of a notebook page over SSH."""
+    from remarkable_mcp import notebooks as nb
+    from remarkable_mcp import page_edit
+
+    def rewrite(original, content):
+        base = original
+        if base is None:
+            base = nb.blank_page_rm_bytes(author_uuid=nb.content_author_uuid(content))
+        return page_edit.set_page_text(base, text), {"created_page": original is None}
+
+    fields, error = _ssh_edit_page(document, page, defer_restart, rewrite, notebook_only=True)
+    if error:
+        return error
+    hint = _write_result_message(
+        not fields["refresh_pending"],
+        _text_hint(text, page, fields["document"]),
+        "Call remarkable_read(document) to check the text.",
+    )
+    return make_response(fields, hint)
+
+
+def _cloud_author_edit_page(client, document: str, page: int, edit) -> tuple:
+    """Run a cloud page edit; return ``(response_fields, None)`` or ``(None, error)``.
+
+    ``edit(target, page_id)`` calls the client and returns its result dict.
+    """
+    from requests import RequestException
+
+    from remarkable_mcp.sync import CloudWriteError, NotANotebookError
+
+    target, error = _find_author_target(client, document)
+    if error:
+        return None, error
+    content_data = _parse_content(client.download_raw_file(target, "content"))
+    page_ids, error = _draw_page_ids(content_data, page, target.VissibleName)
+    if error:
+        return None, error
+
+    try:
+        fields = edit(target, page_ids[page - 1])
+    except NotANotebookError as e:
+        return None, _not_a_notebook_error(e)
+    # ValueError covers PageEditError, blob indexes and pages rmscene cannot read.
+    except (CloudWriteError, RequestException, ValueError) as e:
+        return None, _page_edit_error(e, page, target.VissibleName)
+    _invalidate_client_cache(client)
+    _clear_document_extraction_cache(target.ID)
+    fields = dict(fields)
+    fields.update(
+        document=target.VissibleName,
+        page=page,
+        total_pages=len(page_ids),
+        transport="cloud",
+        refresh_pending=False,
+    )
+    return fields, None
+
+
+def _cloud_author_erase(client, document: str, page: int, region: Optional[list]) -> str:
+    """Erase strokes from a page of a cloud document."""
+    fields, error = _cloud_author_edit_page(
+        client,
+        document,
+        page,
+        lambda target, page_id: client.erase_page_strokes(target.ID, page_id, region),
+    )
+    if error:
+        return error
+    return make_response(
+        fields,
+        f"{_erase_hint(fields['erased'], page, fields['document'], region)} The tablet "
+        "picks the change up on its next sync. Call remarkable_canvas(document, page) "
+        "to view the updated page.",
+    )
+
+
+def _cloud_author_set_text(client, document: str, page: int, text: str) -> str:
+    """Replace the typed text of a page of a cloud notebook."""
+    fields, error = _cloud_author_edit_page(
+        client,
+        document,
+        page,
+        lambda target, page_id: client.set_page_text(target.ID, page_id, text),
+    )
+    if error:
+        return error
+    return make_response(
+        fields,
+        f"{_text_hint(text, page, fields['document'])} The tablet picks the change up "
+        "on its next sync. Call remarkable_read(document) to check the text.",
+    )
+
+
 def register_write_tools():
     """Register all write tools with the MCP server."""
     # Imported lazily to break a circular import: server.py imports this module
@@ -1625,6 +1843,7 @@ def register_write_tools():
         document: Optional[str] = None,
         page: Optional[int] = None,
         strokes: Optional[list] = None,
+        region: Optional[list] = None,
         name: Optional[str] = None,
         text: Optional[str] = None,
         folder: Optional[str] = None,
@@ -1633,27 +1852,35 @@ def register_write_tools():
         ctx: Context = None,
     ) -> str:
         """
-        <usecase>Author native reMarkable ink and notebooks. ONE compound write
-        primitive with three methods: "draw" appends pen/highlighter strokes to a
-        page, "add_page" appends a blank drawable page to a notebook, and
-        "create_document" creates a new notebook (optionally seeded with typed
-        text). This is the single tool behind the interactive canvas (Save → draw,
-        ＋Page → add_page, new notebook → create_document) AND model-driven markup
-        (highlighting, underlining, marking) — the model composes the strokes.</usecase>
+        <usecase>Author and edit native reMarkable ink and notebooks. ONE compound
+        write primitive with five methods: "draw" appends pen/highlighter strokes
+        to a page, "erase" removes strokes from a page, "set_text" replaces or
+        removes the typed text of a notebook page, "add_page" appends a blank
+        drawable page to a notebook, and "create_document" creates a new notebook
+        (optionally seeded with typed text). This is the single tool behind the
+        interactive canvas (Save → draw, ＋Page → add_page, new notebook →
+        create_document) AND model-driven markup and edits (highlighting,
+        underlining, marking, erasing, rewriting text) — the model composes the
+        strokes.</usecase>
         <instructions>
         Requires write mode (the default; disabled with --read-only). Support by
         transport:
-        - SSH: all three methods.
-        - Cloud: all three methods, also when an SSH configuration fell back to
+        - SSH: all five methods.
+        - Cloud: all five methods, also when an SSH configuration fell back to
           the cloud because the tablet was unreachable. The tablet picks the
-          change up on its next sync. draw and add_page re-read the document
-          on every commit attempt and only append, so ink or pages another
-          device already synced to the cloud are kept. Edits a tablet has not
+          change up on its next sync. Every method re-reads the document on each
+          commit attempt and rewrites only the page it targets, so ink, text or
+          pages another device already synced to the cloud are kept (erase also
+          erases synced strokes crossing its region). Edits a tablet has not
           synced yet are outside this guarantee.
         - USB web: not available (the tool is not registered).
-        All methods are non-destructive (draw appends to existing ink; over SSH
-        it also backs the page up to {pageId}.rm.bak the first time), so no
-        confirmation prompt is required.
+        draw, add_page and create_document only add. erase and set_text remove
+        content, the way the device eraser and keyboard do: erased strokes and
+        replaced characters stay in the page as CRDT deletions, and every other
+        block of the page is kept byte for byte. Over SSH every method that
+        changes a page backs it up to {pageId}.rm.bak the first time. No
+        confirmation prompt is shown, so only erase or replace what the user
+        asked for.
 
         Pick the method, then pass only that method's parameters:
 
@@ -1665,6 +1892,19 @@ def register_write_tools():
           tool maps them to the page's own paper_size so the same payload works on
           any device. (PDF-backed pages currently use the same map; precise PDF
           overlay placement is a follow-up.)
+
+        - method="erase": requires `document` + `page`. Without `region` it
+          erases EVERY stroke on the page; with `region` = [x0, y0, x1, y1]
+          (normalized, top-left origin, like draw) it erases each stroke with a
+          point inside that rectangle. Typed text is left alone. Works on
+          notebooks and PDF/EPUB annotation layers.
+
+        - method="set_text": requires `document` + `page` + `text`. Replaces the
+          page's whole typed text with `text` (same line prefixes as
+          create_document); text="" removes it. Ink is kept, but a highlight
+          anchored to the old text loses its anchor. To change one line, read the
+          page with remarkable_read first and send the full edited text back.
+          Native notebooks only.
 
         - method="add_page": requires `document`. Appends one blank page to the END
           of a native notebook and returns its 1-based page number. Only native
@@ -1682,21 +1922,25 @@ def register_write_tools():
         calling it directly should omit ui_submitted.
         </instructions>
         <parameters>
-        - method: "draw" | "add_page" | "create_document".
-        - document: Target document name/path/id (draw, add_page).
-        - page: 1-based page number (draw).
+        - method: "draw" | "erase" | "set_text" | "add_page" | "create_document".
+        - document: Target document name/path/id (draw, erase, set_text, add_page).
+        - page: 1-based page number (draw, erase, set_text).
         - strokes: List of stroke dicts (draw). Each:
             {"points": [[nx, ny], [nx, ny, pressure], ...],
              "tool": "fineliner" | "highlighter" | int,
              "color": "black" | "yellow" | ...,
              "width": <optional float>, "thickness_scale": <optional float>}
+        - region: Optional [x0, y0, x1, y1] rectangle in [0,1] (erase). Omit it
+            to erase the whole page's ink.
         - name: Title of the new notebook (create_document).
-        - text: Optional typed text for the first page (create_document). Omit it
-            unless the user explicitly requested specific content; never fabricate
-            placeholder text. Paragraphs split on newlines; a line prefix sets the
-            native paragraph style: "# " title, "## " heading, "### " subheading,
-            "- " or "* " bullet, "  - " second-level bullet, "1. " numbered item
-            (the device renumbers), "- [ ] " checkbox, "- [x] " checked checkbox.
+        - text: Typed text for the first page (create_document, optional) or the
+            page's new text (set_text, required; "" removes it). For
+            create_document omit it unless the user explicitly requested specific
+            content; never fabricate placeholder text. Paragraphs split on
+            newlines; a line prefix sets the native paragraph style: "# " title,
+            "## " heading, "### " subheading, "- " or "* " bullet, "  - "
+            second-level bullet, "1. " numbered item (the device renumbers),
+            "- [ ] " checkbox, "- [x] " checked checkbox.
             Other lines are body text. Inline bold/italic is not supported.
         - folder: Destination folder path (create_document; default "/").
         - ui_submitted: Set by the canvas app when the user clicked Save. Models omit it.
@@ -1708,6 +1952,12 @@ def register_write_tools():
         <examples>
         - remarkable_author(method="draw", document="Ideas", page=1,
             strokes=[{"points": [[0.1,0.2],[0.8,0.2]], "tool": "highlighter", "color": "yellow"}])
+        - remarkable_author(method="erase", document="Ideas", page=1,
+            region=[0.0, 0.0, 1.0, 0.25])  # strokes in the top quarter
+        - remarkable_author(method="erase", document="Ideas", page=2)  # all ink
+        - remarkable_author(method="set_text", document="Ideas", page=1,
+            text="# Ideas\n- First\n- Second")
+        - remarkable_author(method="set_text", document="Ideas", page=1, text="")
         - remarkable_author(method="add_page", document="Ideas")
         - remarkable_author(method="create_document", name="Sketches")
         - remarkable_author(method="create_document", name="Meeting notes",
@@ -1723,6 +1973,7 @@ def register_write_tools():
             page,
             strokes,
             name,
+            text,
         )
         if validation_error:
             return validation_error
@@ -1739,12 +1990,20 @@ def register_write_tools():
                 client = _get_ssh_client()
                 if method == "draw":
                     return _cloud_author_draw(client, document, page, strokes, ui_submitted)
+                if method == "erase":
+                    return _cloud_author_erase(client, document, page, region)
+                if method == "set_text":
+                    return _cloud_author_set_text(client, document, page, text)
                 if method == "add_page":
                     return _cloud_author_add_page(client, document)
                 return _cloud_author_create_document(client, name, text, folder)
 
             if method == "draw":
                 return _author_draw(document, page, strokes, ui_submitted, defer_restart)
+            if method == "erase":
+                return _author_erase(document, page, region, defer_restart)
+            if method == "set_text":
+                return _author_set_text(document, page, text, defer_restart)
             if method == "add_page":
                 return _author_add_page(document, defer_restart)
             if method == "create_document":

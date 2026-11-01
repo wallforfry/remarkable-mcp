@@ -290,7 +290,7 @@ class CloudWriteError(RuntimeError):
 
 
 class NotANotebookError(CloudWriteError):
-    """Raised when a page is added to a document that is not a native notebook."""
+    """Raised when a notebook-only page edit targets a PDF or EPUB."""
 
 
 # CRC32C (Castagnoli) table for the GCS ``x-goog-hash`` upload integrity header.
@@ -1225,6 +1225,89 @@ class RemarkableClient:
 
         self._edit_document(doc_id, edit)
         return drawn
+
+    def _rewrite_page(self, doc_id: str, page_id: str, rewrite: "Any") -> None:
+        """Replace one page's ``.rm`` with what ``rewrite`` builds from it.
+
+        ``rewrite(original, content)`` receives the page bytes (``None`` when
+        the page has no ``.rm`` yet) and the parsed ``.content``, and returns
+        the new bytes, or ``None`` to leave the page alone. When a retry finds
+        bytes an earlier attempt wrote, that commit landed and its
+        acknowledgement was lost, so the page is not rewritten again.
+        """
+        from remarkable_mcp import notebooks as nb
+
+        page_name = f"{doc_id}/{page_id}.rm"
+        written: List[bytes] = []
+
+        def edit(read_blob):
+            content = self._read_content(doc_id, read_blob)
+            if page_id not in nb.page_ids_from_content(content):
+                raise CloudWriteError(f"Page {page_id} is no longer in document {doc_id}.")
+            original = read_blob(page_name)
+            if original is not None and original in written:
+                return None
+            new_bytes = rewrite(original, content)
+            if new_bytes is None or new_bytes == original:
+                return None
+            written.append(new_bytes)
+            return {page_name: new_bytes}
+
+        self._edit_document(doc_id, edit)
+
+    def erase_page_strokes(
+        self, doc_id: str, page_id: str, region: Optional[List[float]] = None
+    ) -> Dict[str, Any]:
+        """Erase strokes from one page, all of them or those crossing ``region``.
+
+        Returns ``{"erased": int}``. Only ``{doc_id}/{page_id}.rm`` changes.
+        Each attempt erases what the page holds in the root it rebuilds, so
+        ink another client committed first is erased too when it crosses the
+        region. Raises ``PageEditError`` when the region or page bytes cannot
+        be read.
+        """
+        from remarkable_mcp import page_edit
+
+        erased = {"erased": 0}
+
+        def rewrite(original, _content):
+            if original is None:
+                erased["erased"] = 0
+                return None
+            new_bytes, erased["erased"] = page_edit.erase_strokes(original, region)
+            return new_bytes
+
+        self._rewrite_page(doc_id, page_id, rewrite)
+        return erased
+
+    def set_page_text(self, doc_id: str, page_id: str, text: str) -> Dict[str, Any]:
+        """Replace the typed text of one notebook page; ``""`` removes it.
+
+        Returns ``{"created_page": bool}``, true when the page had no ``.rm``
+        yet and was seeded with a blank layer first. Only
+        ``{doc_id}/{page_id}.rm`` changes and its ink is kept. Raises
+        ``NotANotebookError`` for a PDF or EPUB, whose pages take no typed
+        text, and ``PageEditError`` when the page bytes cannot be read.
+        """
+        from remarkable_mcp import notebooks as nb
+        from remarkable_mcp import page_edit
+
+        seeded = {"created_page": False}
+
+        def rewrite(original, content):
+            if content.get("fileType") != "notebook":
+                raise NotANotebookError(
+                    f"Document {doc_id} is not a native notebook; only notebook "
+                    "pages carry typed text."
+                )
+            seeded["created_page"] = original is None
+            base = original
+            if base is None:
+                base = nb.blank_page_rm_bytes(author_uuid=nb.content_author_uuid(content))
+            return page_edit.set_page_text(base, text)
+
+        self._rewrite_page(doc_id, page_id, rewrite)
+        return seeded
 
     def rename(self, doc_id: str, new_name: str) -> None:
         """Rename a document or folder in the cloud."""
