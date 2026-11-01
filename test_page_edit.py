@@ -173,7 +173,7 @@ class TestSetPageText:
     def test_replaces_text_and_keeps_ink(self, tmp_path):
         edited, detached = page_edit.set_page_text(_page(), "# Plan\n- Ship\nDone")
 
-        assert _text(edited, tmp_path) == ["Plan", "Ship", "Done"]
+        assert _text(edited, tmp_path) == ["# Plan", "- Ship", "Done"]
         assert len(_live_lines(edited)) == 2
         assert detached == 0
 
@@ -286,6 +286,21 @@ class TestSetPageText:
         changed = [i for i, (a, b) in enumerate(zip(before, after)) if a != b]
         assert len(before) == len(after)
         assert [type(page_edit._parse_block(before[i])) for i in changed] == [RootTextBlock]
+
+
+class TestReadEditRoundTrip:
+    def test_editing_one_read_line_keeps_styles_and_anchored_ink(self, tmp_path):
+        page, anchor = _anchored_page()
+        page, _ = page_edit.set_page_text(page, "# Title line\nBody line\n- [x] Done")
+        lines = _text(page, tmp_path)
+        assert lines == ["# Title line", "Body line", "- [x] Done"]
+
+        lines.insert(1, "## Added")
+        edited, detached = page_edit.set_page_text(page, "\n".join(lines))
+
+        assert _text(edited, tmp_path) == ["# Title line", "## Added", "Body line", "- [x] Done"]
+        assert detached == 0
+        assert _anchor_y(edited, anchor) > _anchor_y(page, anchor)
 
 
 class TestAnchoredInk:

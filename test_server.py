@@ -4531,7 +4531,7 @@ class TestCloudEditNotebook:
         after = store.doc_blobs(doc_id)
 
         assert result == {"created_page": False, "detached_annotations": 0}
-        assert self._page_text(store, doc_id, page_id, tmp_path) == ["Plan", "Ship"]
+        assert self._page_text(store, doc_id, page_id, tmp_path) == ["# Plan", "- Ship"]
         assert len(_page_lines(after[f"{doc_id}/{page_id}.rm"])) == 2
         assert after[f"{doc_id}.content"] == before[f"{doc_id}.content"]
 
@@ -8424,7 +8424,7 @@ class TestSSHPageEdit:
         assert list(writes) == [rm]
         path = tmp_path / "page.rm"
         path.write_bytes(writes[rm])
-        assert extract_text_from_rm_file(path) == ["Plan"]
+        assert extract_text_from_rm_file(path) == ["# Plan"]
         assert restart.called is not defer_restart
 
     @pytest.mark.asyncio

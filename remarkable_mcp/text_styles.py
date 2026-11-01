@@ -1,22 +1,32 @@
-"""Native paragraph styles for typed text on generated notebook pages.
+"""Native paragraph styles for typed text, as Markdown line prefixes.
 
 Markdown line prefixes select one of the paragraph styles a Paper Pro offers,
-and the styles are written into the page's root text block. rmscene 0.8 does
-not know the numbered-list code (10) and cannot write the two extra fields that
+and the styles are written into the page's root text block; reading a page
+turns its styles back into the same prefixes. rmscene 0.8 does not know the
+numbered-list code (10) and cannot read or write the two extra fields that
 tell the larger heading from the smaller one, so the style entries are encoded
-here. Their bytes match a page styled on a Paper Pro and read back from the
+and decoded here. Their bytes match a page styled on a Paper Pro and read back from the
 cloud; the meaning of the extra fields is unknown.
 """
 
 from __future__ import annotations
 
 import enum
+import io
 import re
 from dataclasses import dataclass, replace
+from typing import Optional
 
-from rmscene.scene_stream import RootTextBlock, text_item_to_stream
-from rmscene.tagged_block_common import CrdtId, LwwValue
+from rmscene.scene_items import Text
+from rmscene.scene_stream import (
+    RootTextBlock,
+    text_item_from_stream,
+    text_item_to_stream,
+)
+from rmscene.tagged_block_common import CrdtId, LwwValue, TagType
+from rmscene.tagged_block_reader import TaggedBlockReader
 from rmscene.tagged_block_writer import TaggedBlockWriter
+from rmscene.text import TextDocument
 
 
 class TextStyle(enum.Enum):
@@ -168,3 +178,91 @@ def styled_root_text(
         value=replace(block.value, styles=paragraph_styles(paragraphs)),
         extra_data=block.extra_data,
     )
+
+
+# The prefix each style is written back as: the first one that selects it.
+_STYLE_PREFIXES = {}
+for _prefix, _style in LINE_PREFIXES:
+    _STYLE_PREFIXES.setdefault(_style, _prefix)
+
+
+def _style_for(code: int, extra_fields: tuple) -> TextStyle:
+    """Return the style a format code and its extra fields encode.
+
+    An unknown code reads as body text, and a known code with unknown extra
+    fields as the style that has that code and none.
+    """
+    candidates = [style for style in TextStyle if style.code == code]
+    for style in candidates:
+        if style.extra_fields == extra_fields:
+            return style
+    return next((style for style in candidates if not style.extra_fields), TextStyle.BODY)
+
+
+def _read_style_entry(reader: TaggedBlockReader) -> tuple[CrdtId, TextStyle]:
+    char_id = reader.data.read_crdt_id()
+    reader.read_id(1)
+    with reader.read_subblock(2) as entry:
+        end = entry.offset + entry.size
+        reader.data.read_uint8()  # _STYLE_ENTRY_MARKER
+        code = reader.data.read_uint8()
+        extra = []
+        if reader.data.tell() < end and reader.data.check_tag(2, TagType.Byte1):
+            extra.append((2, "byte", reader.read_byte(2)))
+        if reader.data.tell() < end and reader.data.check_tag(3, TagType.Byte4):
+            extra.append((3, "int", reader.read_int(3)))
+    return char_id, _style_for(code, tuple(extra))
+
+
+def _read_root_text_styles(reader: TaggedBlockReader) -> dict[CrdtId, TextStyle]:
+    """Read the style map of the root text block ``reader`` is positioned in."""
+    reader.read_id(1)
+    with reader.read_subblock(2):
+        with reader.read_subblock(1):
+            with reader.read_subblock(1):
+                for _ in range(reader.data.read_varuint()):
+                    text_item_from_stream(reader)
+        with reader.read_subblock(2):
+            with reader.read_subblock(1):
+                count = reader.data.read_varuint()
+                styles = dict(_read_style_entry(reader) for _ in range(count))
+    with reader.read_subblock(3):
+        reader.data.read_float64()
+        reader.data.read_float64()
+    reader.read_float(4)
+    return styles
+
+
+def read_paragraph_styles(page_bytes: bytes) -> dict[CrdtId, TextStyle]:
+    """Return the paragraph styles of a ``.rm`` page, keyed like ``Text.styles``.
+
+    Empty when the page has no typed text.
+    """
+    reader = TaggedBlockReader(io.BytesIO(page_bytes))
+    reader.read_header()
+    while True:
+        with reader.read_block() as block:
+            if block is None:
+                return {}
+            if block.block_type == RootTextBlock.BLOCK_TYPE:
+                return _read_root_text_styles(reader)
+            reader.data.read_bytes(block.size)
+
+
+def markdown_lines(text: Text, styles: Optional[dict] = None) -> list[str]:
+    """Return a page's paragraphs with the line prefixes of their styles.
+
+    ``styles`` comes from :func:`read_paragraph_styles`; without it every
+    paragraph reads as body text. Numbered items are numbered from 1 in each
+    run, the way the device displays them. The output parses back to the same
+    styles with :func:`parse_paragraphs`.
+    """
+    styles = styles or {}
+    lines = []
+    number = 0
+    for paragraph in TextDocument.from_scene_item(text).contents:
+        style = styles.get(paragraph.start_id, TextStyle.BODY)
+        number = number + 1 if style is TextStyle.NUMBERED else 0
+        prefix = f"{number}. " if style is TextStyle.NUMBERED else _STYLE_PREFIXES.get(style, "")
+        lines.append(prefix + str(paragraph))
+    return lines

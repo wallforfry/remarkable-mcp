@@ -348,6 +348,10 @@ async def remarkable_read(
       may not be synced to the cloud).
     - "annotations": Only annotations, highlights, and handwritten notes
 
+    Typed text keeps the Markdown line prefix of each paragraph style ("# "
+    title, "## " heading, "- " bullet, "- [x] " checked box, "1. " numbered
+    item...), the same prefixes remarkable_author accepts.
+
     Use pagination to read large documents without overwhelming context:
     - Start with page=1 (default)
     - Check "more" field - if true, there's more content

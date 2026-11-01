@@ -345,15 +345,23 @@ def extract_text_from_rm_file(rm_file_path: Path) -> List[str]:
     Extract typed text from a .rm file using rmscene.
 
     This extracts text that was typed via Type Folio or on-screen keyboard.
-    Does NOT require OCR - text is stored natively in v6 .rm files.
+    Does NOT require OCR - text is stored natively in v6 .rm files. Each
+    paragraph carries the Markdown line prefix of its style ("# " title,
+    "- " bullet, "- [x] " checked box...), the same prefixes
+    ``remarkable_author`` accepts, so a page read then rewritten with
+    ``set_text`` keeps its styles. Blank paragraphs between others are kept
+    for the same reason; trailing ones are dropped.
     """
     try:
+        import io
+
         from rmscene import read_blocks
         from rmscene.scene_items import Text
-        from rmscene.text import TextDocument
 
-        with open(rm_file_path, "rb") as f:
-            blocks = list(read_blocks(f))
+        from remarkable_mcp.text_styles import markdown_lines, read_paragraph_styles
+
+        data = Path(rm_file_path).read_bytes()
+        blocks = list(read_blocks(io.BytesIO(data)))
 
         # The page's typed text lives on the RootTextBlock, not among the
         # root group's children (those are the ink layers), so scan the raw
@@ -365,11 +373,15 @@ def extract_text_from_rm_file(rm_file_path: Path) -> List[str]:
         if text_item is None:
             return []
 
-        # TextDocument resolves the CRDT character sequence into ordered,
-        # styled paragraphs; iterating Text.items directly yields CRDT ids
-        # and fragments in insertion order, not readable lines.
-        doc = TextDocument.from_scene_item(text_item)
-        return [line for line in (str(para).strip() for para in doc.contents) if line]
+        try:
+            styles = read_paragraph_styles(data)
+        except Exception:
+            logger.debug("Unreadable paragraph styles in %s", rm_file_path, exc_info=True)
+            styles = {}
+        lines = markdown_lines(text_item, styles)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return lines
 
     except ImportError:
         return []  # rmscene not available

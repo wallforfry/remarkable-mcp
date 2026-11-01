@@ -1914,8 +1914,9 @@ def register_write_tools():
           removed above it. Ink anchored to deleted text stays where that text
           was; the response counts it in detached_annotations. Ink drawn freely on the
           page never moves. To change one line, read the page with
-          remarkable_read first and send the full text back with that line
-          edited, line prefixes included. Native notebooks only.
+          remarkable_read first (its typed text carries the same line
+          prefixes) and send the full text back with that line edited. Native
+          notebooks only.
 
         - method="add_page": requires `document`. Appends one blank page to the END
           of a native notebook and returns its 1-based page number. Only native
