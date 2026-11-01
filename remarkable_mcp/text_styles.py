@@ -93,19 +93,25 @@ def parse_paragraphs(text: str) -> list[tuple[TextStyle, str]]:
     return paragraphs
 
 
-def paragraph_styles(paragraphs: list[tuple[TextStyle, str]]) -> dict:
+def paragraph_styles(
+    paragraphs: list[tuple[TextStyle, str]],
+    first_char_id: CrdtId = _TEXT_FIRST_CHAR_ID,
+    timestamp: CrdtId = _STYLE_TIMESTAMP,
+) -> dict:
     """Return the ``Text.styles`` map for paragraphs joined with newlines.
 
-    Like ``simple_text_document``, later paragraphs get an entry only when they
-    are not ``BODY``: an unstyled paragraph renders as body text, and plain
-    input keeps the exact bytes of the unstyled builder.
+    ``first_char_id`` is the id of the first character of the joined text, and
+    ``timestamp`` the last-writer-wins stamp of every entry. Like
+    ``simple_text_document``, later paragraphs get an entry only when they are
+    not ``BODY``: an unstyled paragraph renders as body text, and plain input
+    keeps the exact bytes of the unstyled builder.
     """
-    styles = {CrdtId(0, 0): LwwValue(timestamp=_STYLE_TIMESTAMP, value=paragraphs[0][0])}
+    styles = {CrdtId(0, 0): LwwValue(timestamp=timestamp, value=paragraphs[0][0])}
     offset = len(paragraphs[0][1]) + 1
     for style, content in paragraphs[1:]:
         if style != TextStyle.BODY:
-            newline_id = CrdtId(_TEXT_FIRST_CHAR_ID.part1, _TEXT_FIRST_CHAR_ID.part2 + offset - 1)
-            styles[newline_id] = LwwValue(timestamp=_STYLE_TIMESTAMP, value=style)
+            newline_id = CrdtId(first_char_id.part1, first_char_id.part2 + offset - 1)
+            styles[newline_id] = LwwValue(timestamp=timestamp, value=style)
         offset += len(content) + 1
     return styles
 
