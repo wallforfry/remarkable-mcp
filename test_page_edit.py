@@ -114,77 +114,159 @@ class TestEraseStrokes:
             page_edit.erase_strokes(_page(), region)
 
 
+def _anchored_page() -> tuple[bytes, CrdtId]:
+    """Return a page whose one stroke group is anchored to "Body line", and that char's id."""
+    from rmscene import scene_items as si
+    from rmscene.crdt_sequence import CrdtSequenceItem
+    from rmscene.scene_items import LwwValue
+    from rmscene.scene_stream import SceneTreeBlock, TreeNodeBlock
+
+    page = nb.page_rm_bytes("Title line\nBody line")
+    first = _root_text(page).items.sequence_items()[0].item_id
+    anchor = CrdtId(first.part1, first.part2 + len("Title line\n"))
+    group_id = CrdtId(0, 900)
+    line = si.Line(
+        color=si.PenColor.BLACK,
+        tool=si.Pen.BALLPOINT_1,
+        points=[si.Point(x=0.0, y=10.0, speed=0, direction=0, width=2, pressure=0)],
+        thickness_scale=1.0,
+        starting_length=0.0,
+    )
+    blocks = [
+        SceneTreeBlock(
+            tree_id=group_id, node_id=CrdtId(0, 0), is_update=True, parent_id=CrdtId(0, 11)
+        ),
+        TreeNodeBlock(
+            group=si.Group(
+                node_id=group_id,
+                anchor_id=LwwValue(timestamp=CrdtId(0, 901), value=anchor),
+                anchor_type=LwwValue(timestamp=CrdtId(0, 902), value=2),
+                anchor_threshold=LwwValue(timestamp=CrdtId(0, 903), value=100.0),
+                anchor_origin_x=LwwValue(timestamp=CrdtId(0, 904), value=0.0),
+            )
+        ),
+        SceneLineItemBlock(
+            parent_id=group_id,
+            item=CrdtSequenceItem(CrdtId(0, 905), CrdtId(0, 0), CrdtId(0, 0), 0, line),
+        ),
+    ]
+    return page + strokes_mod.serialize_new_blocks(blocks), anchor
+
+
+def _anchor_y(page: bytes, anchor: CrdtId):
+    from remarkable_mcp.extract import _v6_text_elements_with_bounds
+
+    return _v6_text_elements_with_bounds(_blocks(page))[2].get(anchor)
+
+
+def _live_chars(page: bytes) -> list:
+    """Return ``(char, id)`` for every live character of the page's text."""
+    return [
+        (char, CrdtId(item.item_id.part1, item.item_id.part2 + n))
+        for item in _root_text(page).items.sequence_items()
+        if isinstance(item.value, str) and not item.deleted_length
+        for n, char in enumerate(item.value)
+    ]
+
+
 class TestSetPageText:
     def test_replaces_text_and_keeps_ink(self, tmp_path):
-        page = _page()
-
-        edited = page_edit.set_page_text(page, "# Plan\n- Ship\nDone")
+        edited, detached = page_edit.set_page_text(_page(), "# Plan\n- Ship\nDone")
 
         assert _text(edited, tmp_path) == ["Plan", "Ship", "Done"]
         assert len(_live_lines(edited)) == 2
+        assert detached == 0
 
-    def test_old_characters_stay_as_deleted_runs(self):
-        page = _page()
-        old = _root_text(page).items.sequence_items()
+    def test_unchanged_characters_keep_their_ids(self):
+        page = _page("Agenda\nFollow-ups")
+        before = dict((cid, c) for c, cid in _live_chars(page))
 
-        edited = page_edit.set_page_text(page, "New")
+        edited, _ = page_edit.set_page_text(page, "Agenda\nNew line\nFollow-ups")
+
+        after = _live_chars(edited)
+        assert "".join(c for c, _ in after) == "Agenda\nNew line\nFollow-ups"
+        kept = [cid for c, cid in after if before.get(cid) == c]
+        assert len(kept) == len("Agenda\nFollow-ups")
+
+    def test_removed_characters_become_deleted_runs(self):
+        page = _page("Keep this\nDrop this")
+        dropped = {cid for c, cid in _live_chars(page)[len("Keep this") :]}
+
+        edited, _ = page_edit.set_page_text(page, "Keep this")
+
         items = _root_text(edited).items.sequence_items()
+        deleted = {
+            CrdtId(i.item_id.part1, i.item_id.part2 + n)
+            for i in items
+            if i.deleted_length
+            for n in range(i.deleted_length)
+        }
+        assert deleted == dropped
+        assert "".join(c for c, _ in _live_chars(edited)) == "Keep this"
 
-        deleted, [inserted] = items[: len(old)], items[len(old) :]
-        assert [d.item_id for d in deleted] == [o.item_id for o in old]
-        assert all(d.value == "" and d.deleted_length == len(o.value) for d, o in zip(deleted, old))
-        assert inserted.value == "New"
+    def test_inserted_ids_are_above_every_existing_id(self):
+        page = _page()
         stroke_ids = [b.item.item_id for b in _blocks(page) if isinstance(b, SceneLineItemBlock)]
-        assert inserted.item_id.part2 > max(i.part2 for i in stroke_ids)
+        old_ids = {cid for _, cid in _live_chars(page)}
+
+        edited, _ = page_edit.set_page_text(page, "Agenda\nMore\nFollow-ups")
+
+        new_ids = [cid for _, cid in _live_chars(edited) if cid not in old_ids]
+        assert new_ids
+        assert min(i.part2 for i in new_ids) > max(i.part2 for i in stroke_ids)
 
     def test_styles_follow_the_line_prefixes(self):
-        edited = page_edit.set_page_text(_page(), "# Plan\nbody\n- [ ] todo")
-        text = _root_text(edited)
-        first = text.items.sequence_items()[-1].item_id
+        edited, _ = page_edit.set_page_text(_page("a\nb\nc"), "# a\nb\n- [ ] c")
+        newlines = [cid for c, cid in _live_chars(edited) if c == "\n"]
 
         # rmscene reads the codes back into its own enum.
-        codes = {key: value.value.value for key, value in text.styles.items()}
-        assert codes == {
-            CrdtId(0, 0): TextStyle.TITLE.code,
-            CrdtId(first.part1, first.part2 + len("Plan\nbody")): TextStyle.CHECKBOX.code,
-        }
+        codes = {key: value.value.value for key, value in _root_text(edited).styles.items()}
+        assert codes == {CrdtId(0, 0): TextStyle.TITLE.code, newlines[1]: TextStyle.CHECKBOX.code}
+
+    def test_unstyling_a_paragraph_writes_an_explicit_body_entry(self):
+        page, _ = page_edit.set_page_text(_page("a\nb"), "a\n- b")
+        newline = next(cid for c, cid in _live_chars(page) if c == "\n")
+
+        edited, _ = page_edit.set_page_text(page, "a\nb")
+
+        styles = _root_text(edited).styles
+        assert styles[newline].value.value == TextStyle.BODY.code
 
     def test_style_stamps_win_over_existing_entries(self):
         page = _page()
         old_stamp = max(v.timestamp.part2 for v in _root_text(page).styles.values())
 
-        edited = page_edit.set_page_text(page, "x")
+        edited, _ = page_edit.set_page_text(page, "x")
 
         assert all(v.timestamp.part2 > old_stamp for v in _root_text(edited).styles.values())
 
     def test_empty_text_removes_the_typed_text(self, tmp_path):
-        edited = page_edit.set_page_text(_page(), "")
+        edited, _ = page_edit.set_page_text(_page(), "")
 
         assert _text(edited, tmp_path) in ([], [""])
-        assert all(i.deleted_length for i in _root_text(edited).items.sequence_items())
+        assert _live_chars(edited) == []
 
     def test_blank_page_keeps_its_empty_item_live(self, tmp_path):
         page = _page(text="", strokes=())
 
-        edited = page_edit.set_page_text(page, "Hi")
+        edited, _ = page_edit.set_page_text(page, "Hi")
 
         items = _root_text(edited).items.sequence_items()
         assert [(i.value, i.deleted_length) for i in items] == [("", 0), ("Hi", 0)]
-        assert items[-1].left_id == CrdtId(0, 0)
         assert _text(edited, tmp_path) == ["Hi"]
 
     def test_repeated_edits_stay_readable(self, tmp_path):
         page = _page()
-        for text in ("one", "", "two\nthree"):
-            page = page_edit.set_page_text(page, text)
+        for text in ("Agenda\none", "", "two\nthree", "two\nmiddle\nthree"):
+            page, _ = page_edit.set_page_text(page, text)
 
-        assert _text(page, tmp_path) == ["two", "three"]
+        assert _text(page, tmp_path) == ["two", "middle", "three"]
         read_tree(io.BytesIO(page))
 
     def test_adds_text_to_an_ink_only_page(self, tmp_path):
         ink_only = _without_root_text(_page())
 
-        edited = page_edit.set_page_text(ink_only, "Hello")
+        edited, _ = page_edit.set_page_text(ink_only, "Hello")
 
         assert _text(edited, tmp_path) == ["Hello"]
         assert len(_live_lines(edited)) == 2
@@ -192,18 +274,59 @@ class TestSetPageText:
     def test_empty_text_on_an_ink_only_page_is_a_no_op(self):
         ink_only = _without_root_text(_page())
 
-        assert page_edit.set_page_text(ink_only, "") == ink_only
+        assert page_edit.set_page_text(ink_only, "") == (ink_only, 0)
 
     def test_untouched_blocks_stay_byte_identical(self):
         page = _page() + _UNKNOWN_BLOCK
 
-        edited = page_edit.set_page_text(page, "Changed")
+        edited, _ = page_edit.set_page_text(page, "Changed")
 
         before = page_edit._split_blocks(page)
         after = page_edit._split_blocks(edited)
         changed = [i for i, (a, b) in enumerate(zip(before, after)) if a != b]
         assert len(before) == len(after)
         assert [type(page_edit._parse_block(before[i])) for i in changed] == [RootTextBlock]
+
+
+class TestAnchoredInk:
+    """Handwriting anchored to typed text, as written over text on the device."""
+
+    def test_a_line_added_above_moves_the_annotation_down(self):
+        page, anchor = _anchored_page()
+        y_before = _anchor_y(page, anchor)
+
+        edited, detached = page_edit.set_page_text(page, "Title line\nInserted\nBody line")
+
+        assert detached == 0
+        assert _anchor_y(edited, anchor) > y_before
+
+    def test_a_line_removed_above_moves_the_annotation_up(self):
+        page, anchor = _anchored_page()
+        y_before = _anchor_y(page, anchor)
+
+        edited, detached = page_edit.set_page_text(page, "Body line")
+
+        assert detached == 0
+        assert _anchor_y(edited, anchor) < y_before
+
+    def test_editing_the_annotated_line_elsewhere_keeps_the_anchor(self):
+        page, anchor = _anchored_page()
+
+        edited, detached = page_edit.set_page_text(page, "Title line\nBody line, extended")
+
+        assert detached == 0
+        assert _anchor_y(edited, anchor) == _anchor_y(page, anchor)
+
+    def test_deleting_the_anchor_character_is_reported(self):
+        page, anchor = _anchored_page()
+
+        edited, detached = page_edit.set_page_text(page, "Title line")
+
+        assert detached == 1
+        # rmscene keeps a deleted character's id where the text was, so the
+        # annotation collapses onto the line before it.
+        title = _live_chars(edited)[0][1]
+        assert _anchor_y(edited, anchor) == _anchor_y(edited, title)
 
 
 class TestMalformedPages:

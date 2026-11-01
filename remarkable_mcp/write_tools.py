@@ -1648,10 +1648,15 @@ def _erase_hint(erased: int, page: int, doc_name: str, region: Optional[list]) -
     return f"Erased {erased} stroke(s) {scope} from page {page} of '{doc_name}'."
 
 
-def _text_hint(text: str, page: int, doc_name: str) -> str:
-    if text:
-        return f"Replaced the typed text of page {page} of '{doc_name}'."
-    return f"Removed the typed text of page {page} of '{doc_name}'."
+def _text_hint(text: str, page: int, doc_name: str, detached: int) -> str:
+    verb = "Replaced" if text else "Removed"
+    hint = f"{verb} the typed text of page {page} of '{doc_name}'."
+    if detached:
+        hint += (
+            f" {detached} handwritten annotation(s) were anchored to deleted text; "
+            "they now sit where that text was. Check them with remarkable_canvas."
+        )
+    return hint
 
 
 def _ssh_edit_page(
@@ -1746,14 +1751,15 @@ def _author_set_text(document: str, page: int, text: str, defer_restart: bool = 
         base = original
         if base is None:
             base = nb.blank_page_rm_bytes(author_uuid=nb.content_author_uuid(content))
-        return page_edit.set_page_text(base, text), {"created_page": original is None}
+        new_bytes, detached = page_edit.set_page_text(base, text)
+        return new_bytes, {"created_page": original is None, "detached_annotations": detached}
 
     fields, error = _ssh_edit_page(document, page, defer_restart, rewrite, notebook_only=True)
     if error:
         return error
     hint = _write_result_message(
         not fields["refresh_pending"],
-        _text_hint(text, page, fields["document"]),
+        _text_hint(text, page, fields["document"], fields["detached_annotations"]),
         "Call remarkable_read(document) to check the text.",
     )
     return make_response(fields, hint)
@@ -1826,7 +1832,8 @@ def _cloud_author_set_text(client, document: str, page: int, text: str) -> str:
         return error
     return make_response(
         fields,
-        f"{_text_hint(text, page, fields['document'])} The tablet picks the change up "
+        f"{_text_hint(text, page, fields['document'], fields['detached_annotations'])} "
+        "The tablet picks the change up "
         "on its next sync. Call remarkable_read(document) to check the text.",
     )
 
@@ -1901,10 +1908,14 @@ def register_write_tools():
 
         - method="set_text": requires `document` + `page` + `text`. Replaces the
           page's whole typed text with `text` (same line prefixes as
-          create_document); text="" removes it. Ink is kept, but a highlight
-          anchored to the old text loses its anchor. To change one line, read the
-          page with remarkable_read first and send the full edited text back.
-          Native notebooks only.
+          create_document); text="" removes it. Only the characters that differ
+          are deleted or inserted, like the device keyboard, so handwriting
+          anchored to unchanged text follows its line when lines are added or
+          removed above it. Ink anchored to deleted text stays where that text
+          was; the response counts it in detached_annotations. Ink drawn freely on the
+          page never moves. To change one line, read the page with
+          remarkable_read first and send the full text back with that line
+          edited, line prefixes included. Native notebooks only.
 
         - method="add_page": requires `document`. Appends one blank page to the END
           of a native notebook and returns its 1-based page number. Only native

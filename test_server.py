@@ -4530,7 +4530,7 @@ class TestCloudEditNotebook:
         )
         after = store.doc_blobs(doc_id)
 
-        assert result == {"created_page": False}
+        assert result == {"created_page": False, "detached_annotations": 0}
         assert self._page_text(store, doc_id, page_id, tmp_path) == ["Plan", "Ship"]
         assert len(_page_lines(after[f"{doc_id}/{page_id}.rm"])) == 2
         assert after[f"{doc_id}.content"] == before[f"{doc_id}.content"]
@@ -4541,7 +4541,7 @@ class TestCloudEditNotebook:
 
         result = self._run(store, lambda: self._client().set_page_text(doc_id, page_id, "Hi"))
 
-        assert result == {"created_page": True}
+        assert result == {"created_page": True, "detached_annotations": 0}
         assert self._page_text(store, doc_id, page_id, tmp_path) == ["Hi"]
 
     def test_set_text_rejects_non_notebook_before_upload(self):
@@ -4655,7 +4655,7 @@ class TestCloudAuthorDispatch:
             "paper_size": [1620, 2160],
         }
         client.erase_page_strokes.return_value = {"erased": 3}
-        client.set_page_text.return_value = {"created_page": False}
+        client.set_page_text.return_value = {"created_page": False, "detached_annotations": 0}
         return client
 
     def _notebook(self):
@@ -4824,9 +4824,23 @@ class TestCloudAuthorDispatch:
 
         client.set_page_text.assert_called_once_with("doc-1", "p1", text)
         assert data["created_page"] is False
+        assert data["detached_annotations"] == 0
+        assert "annotation" not in data["_hint"]
         assert data["page"] == 1
         assert data["transport"] == "cloud"
         assert data["_hint"].startswith(f"{verb} the typed text of page 1")
+
+    @pytest.mark.asyncio
+    async def test_set_text_reports_detached_annotations(self):
+        client = self._cloud_client([self._notebook()])
+        client.set_page_text.return_value = {"created_page": False, "detached_annotations": 2}
+
+        data = await self._author(
+            client, {"method": "set_text", "document": "Notes", "page": 1, "text": "x"}
+        )
+
+        assert data["detached_annotations"] == 2
+        assert "2 handwritten annotation(s)" in data["_hint"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -8405,6 +8419,7 @@ class TestSSHPageEdit:
 
         rm = f"{wt.XOCHITL_PATH}/doc-abc/page-1.rm"
         assert data["created_page"] is True
+        assert data["detached_annotations"] == 0
         assert data["refresh_pending"] is defer_restart
         assert list(writes) == [rm]
         path = tmp_path / "page.rm"

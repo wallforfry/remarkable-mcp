@@ -1283,16 +1283,19 @@ class RemarkableClient:
     def set_page_text(self, doc_id: str, page_id: str, text: str) -> Dict[str, Any]:
         """Replace the typed text of one notebook page; ``""`` removes it.
 
-        Returns ``{"created_page": bool}``, true when the page had no ``.rm``
-        yet and was seeded with a blank layer first. Only
-        ``{doc_id}/{page_id}.rm`` changes and its ink is kept. Raises
+        Returns ``{"created_page": bool, "detached_annotations": int}``:
+        ``created_page`` is true when the page had no ``.rm`` yet and was
+        seeded with a blank layer first, and ``detached_annotations`` counts
+        the ink groups anchored to a character the edit deleted. Only the
+        characters that change are rewritten, so ink anchored to the others
+        follows its line. Only ``{doc_id}/{page_id}.rm`` changes. Raises
         ``NotANotebookError`` for a PDF or EPUB, whose pages take no typed
         text, and ``PageEditError`` when the page bytes cannot be read.
         """
         from remarkable_mcp import notebooks as nb
         from remarkable_mcp import page_edit
 
-        seeded = {"created_page": False}
+        result = {"created_page": False, "detached_annotations": 0}
 
         def rewrite(original, content):
             if content.get("fileType") != "notebook":
@@ -1300,14 +1303,15 @@ class RemarkableClient:
                     f"Document {doc_id} is not a native notebook; only notebook "
                     "pages carry typed text."
                 )
-            seeded["created_page"] = original is None
+            result["created_page"] = original is None
             base = original
             if base is None:
                 base = nb.blank_page_rm_bytes(author_uuid=nb.content_author_uuid(content))
-            return page_edit.set_page_text(base, text)
+            new_bytes, result["detached_annotations"] = page_edit.set_page_text(base, text)
+            return new_bytes
 
         self._rewrite_page(doc_id, page_id, rewrite)
-        return seeded
+        return result
 
     def rename(self, doc_id: str, new_name: str) -> None:
         """Rename a document or folder in the cloud."""

@@ -9,9 +9,9 @@ Removals follow the CRDT model the device merges pages with, so nothing is
 dropped outright:
 
 - An erased stroke becomes a tombstone block carrying the same item id.
-- Replaced text keeps its characters as deleted runs (same ids, no value), and
-  the new text is inserted after them as one run with fresh ids, its paragraph
-  styles stamped later than every existing entry.
+- A text edit deletes and inserts only the characters that change, like the
+  device keyboard (see :mod:`remarkable_mcp.text_diff`), its paragraph styles
+  stamped later than every existing entry.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from dataclasses import replace
 from typing import Optional
 
 from rmscene import HEADER_V6, read_blocks
-from rmscene.crdt_sequence import CrdtSequence, CrdtSequenceItem
+from rmscene.crdt_sequence import CrdtSequence
 from rmscene.scene_items import Text
 from rmscene.scene_stream import (
     Block,
@@ -35,7 +35,8 @@ from rmscene.scene_stream import (
 from rmscene.tagged_block_common import CrdtId
 
 from remarkable_mcp import strokes as strokes_mod
-from remarkable_mcp.text_styles import StyledRootTextBlock, paragraph_styles, parse_paragraphs
+from remarkable_mcp.text_diff import TextEdit, edit_text, item_span
+from remarkable_mcp.text_styles import StyledRootTextBlock
 
 # uint32 body length, then unknown, min version, current version, block type.
 _BLOCK_HEADER = struct.Struct("<IBBBB")
@@ -129,40 +130,16 @@ def erase_strokes(original_bytes: bytes, region: Optional[list] = None) -> tuple
     return HEADER_V6 + b"".join(edited), erased
 
 
-def _item_length(item: CrdtSequenceItem) -> int:
-    """Return how many character ids a text item spans.
-
-    An unstyled blank page holds one live item with an empty string, which
-    spans no character.
-    """
-    if item.deleted_length:
-        return item.deleted_length
-    return len(item.value) if isinstance(item.value, str) else 1
-
-
-def _last_char_id(item: CrdtSequenceItem) -> CrdtId:
-    return CrdtId(item.item_id.part1, item.item_id.part2 + max(_item_length(item), 1) - 1)
-
-
-def _insertion_anchor(items: list) -> CrdtId:
-    """Return the id of the last character in ``items``, or the end marker."""
-    spanning = [item for item in items if _item_length(item)]
-    return _last_char_id(spanning[-1]) if spanning else _END_MARKER
-
-
 def _max_crdt_id(blocks: list, text: Optional[Text]) -> CrdtId:
     """Return the highest id on the page, text characters and style stamps included."""
     ids = list(strokes_mod._iter_crdt_ids(blocks))
     if text is not None:
-        ids += [_last_char_id(item) for item in text.items.sequence_items()]
+        ids += [
+            CrdtId(item.item_id.part1, item.item_id.part2 + max(item_span(item), 1) - 1)
+            for item in text.items.sequence_items()
+        ]
         ids += [value.timestamp for value in text.styles.values()]
     return max(ids, key=lambda cid: (cid.part1, cid.part2), default=_END_MARKER)
-
-
-def _deleted_run(item: CrdtSequenceItem) -> CrdtSequenceItem:
-    if item.deleted_length or not _item_length(item):
-        return item
-    return replace(item, deleted_length=_item_length(item), value="")
 
 
 def _root_text(blocks: list) -> Optional[int]:
@@ -175,42 +152,17 @@ def _root_text(blocks: list) -> Optional[int]:
     return None
 
 
-def _replacement_text_block(
-    old_block: Optional[RootTextBlock], last: CrdtId, text: str
-) -> StyledRootTextBlock:
-    """Build a root text block holding ``text`` in place of ``old_block``'s.
-
-    Old characters become deleted runs; the new text is one run inserted after
-    them, with ids and a style stamp above ``last``, the page's highest id.
-    """
+def _replacement_text_block(old_block: Optional[RootTextBlock], edit: TextEdit) -> Block:
+    """Build the root text block holding ``edit`` in place of ``old_block``."""
     old_text = old_block.value if old_block is not None else None
-    old_items = old_text.items.sequence_items() if old_text else []
-    author = last.part1 or 1
-    timestamp = CrdtId(author, last.part2 + 1)
-    first_char = CrdtId(author, last.part2 + 2)
-
-    paragraphs = parse_paragraphs(text)
-    body = "\n".join(content for _, content in paragraphs)
-    items = [_deleted_run(item) for item in old_items]
-    if body:
-        items.append(
-            CrdtSequenceItem(
-                item_id=first_char,
-                left_id=_insertion_anchor(old_items),
-                right_id=_END_MARKER,
-                deleted_length=0,
-                value=body,
-            )
-        )
-
     pos_x, pos_y, width = (
         (old_text.pos_x, old_text.pos_y, old_text.width) if old_text else _DEFAULT_TEXT_GEOMETRY
     )
     return StyledRootTextBlock(
         block_id=_END_MARKER,
         value=Text(
-            items=CrdtSequence(items),
-            styles=paragraph_styles(paragraphs, first_char, timestamp),
+            items=CrdtSequence(edit.items),
+            styles=edit.styles,
             pos_x=pos_x,
             pos_y=pos_y,
             width=width,
@@ -219,30 +171,44 @@ def _replacement_text_block(
     )
 
 
-def set_page_text(original_bytes: bytes, text: str) -> bytes:
-    """Replace a page's typed text and return the new page bytes.
+def _detached_groups(blocks: list, deleted_ids: frozenset) -> int:
+    """Count ink groups anchored to a character the edit deleted."""
+    return sum(
+        1
+        for block in blocks
+        if isinstance(block, TreeNodeBlock)
+        and block.group.anchor_id is not None
+        and block.group.anchor_id.value in deleted_ids
+    )
+
+
+def set_page_text(original_bytes: bytes, text: str) -> tuple[bytes, int]:
+    """Replace a page's typed text; return ``(new_bytes, detached_annotations)``.
 
     ``text`` uses the Markdown line prefixes of
     :func:`remarkable_mcp.text_styles.parse_paragraphs`; an empty string
-    removes the typed text. Ink is left alone, but a highlight anchored to the
-    old characters loses its anchor. The input bytes come back unchanged when
-    the page has no typed text and ``text`` is empty. A page without typed
-    text gets its new text block before its first layer, the order
-    ``simple_text_document`` uses.
+    removes the typed text. Only the characters that differ are deleted or
+    inserted (see :mod:`remarkable_mcp.text_diff`), so ink anchored to a kept
+    character follows its line. ``detached_annotations`` counts the ink groups
+    anchored to a deleted character instead. The input bytes come back
+    unchanged when the page has no typed text and ``text`` is empty. A page
+    without typed text gets its new text block before its first layer, the
+    order ``simple_text_document`` uses.
     """
     segments = _split_blocks(original_bytes)
     blocks = [_parse_block(segment) for segment in segments]
     root_index = _root_text(blocks)
     if root_index is None and not text:
-        return original_bytes
+        return original_bytes, 0
 
     old_block = blocks[root_index] if root_index is not None else None
-    last = _max_crdt_id(blocks, old_block.value if old_block is not None else None)
-    new_segment = _serialize_block(_replacement_text_block(old_block, last, text))
+    old_text = old_block.value if old_block is not None else None
+    edit = edit_text(old_text, text, _max_crdt_id(blocks, old_text))
+    new_segment = _serialize_block(_replacement_text_block(old_block, edit))
 
     if root_index is not None:
         segments[root_index] = new_segment
     else:
         layers = [i for i, block in enumerate(blocks) if isinstance(block, TreeNodeBlock)]
         segments.insert(layers[0] if layers else len(segments), new_segment)
-    return HEADER_V6 + b"".join(segments)
+    return HEADER_V6 + b"".join(segments), _detached_groups(blocks, edit.deleted_ids)
