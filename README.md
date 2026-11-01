@@ -625,6 +625,7 @@ Write tools let you upload, organize, and manage documents on your reMarkable. *
 | Delete | ❌ | ✅ (→ trash) | ✅ (→ trash; optional permanent) | ❌ |
 | Create notebook (`remarkable_author` `create_document`) | ❌ | ✅ | ✅ | ❌ |
 | Draw / add page (`remarkable_author` `draw`, `add_page`) | ❌ | ✅ | ✅ | ❌ |
+| Erase ink / edit typed text (`remarkable_author` `erase`, `set_text`) | ❌ | ✅ | ✅ | ❌ |
 
 ### Disabling Write Tools (read-only mode)
 
@@ -675,13 +676,14 @@ Or set the environment variable:
 | `remarkable_rename(document, new_name, defer_restart)` | Rename a document or folder (cloud and SSH) |
 | `remarkable_delete(document, defer_restart, permanent)` | Move a document/folder to Trash; SSH can permanently remove it with `permanent=True` |
 | `remarkable_refresh()` | Safely restart `xochitl` once to apply pending writes made with `defer_restart=True`; no-op after this process has confirmed a clean state — **SSH only** |
-| `remarkable_author(method, ..., defer_restart)` | Author native ink and notebooks — `draw` (append strokes), `add_page` (append a blank notebook page), `create_document` (new notebook) — SSH and cloud |
+| `remarkable_author(method, ..., defer_restart)` | Author and edit native ink and notebooks — `draw` (append strokes), `erase` (remove strokes, all or in a region), `set_text` (replace or remove a page's typed text), `add_page` (append a blank notebook page), `create_document` (new notebook) — SSH and cloud |
 
 ### Safety
 
 - **Upload registers in cloud, SSH, and USB web mode** — local-directory mode never exposes write tools.
 - **mkdir, move, rename, delete register in cloud and SSH modes only** — they are not exposed on USB web (the tablet's USB web firmware has no folder/move/rename/delete endpoints), keeping the tool list scoped to what the active transport actually supports.
 - **Delete prompts for confirmation when possible** — if the client supports MCP elicitation, `remarkable_delete` asks the user to confirm before deleting. MCP SDK 2.x carries that prompt as a multi-round input request for `2026-07-28` clients and as push elicitation for legacy clients. If the client can't show a prompt, the delete is **refused** (not performed) unless `REMARKABLE_SKIP_CONFIRM=1` is set — so write-on-by-default can't silently delete from clients that lack elicitation. Cloud and SSH move items to Trash by default. SSH also supports `permanent=True` for an explicitly requested permanent removal; cloud permanent deletion remains a Trash-management operation in the app/tablet. Set `REMARKABLE_SKIP_CONFIRM=1` to allow deletes without a prompt in automated setups. All write tools carry `ToolAnnotations(read_only_hint=False)` (and `destructive_hint=True` for delete) so an agent harness can gate writes at the MCP layer.
+- **Page edits remove content without a prompt** — `remarkable_author` `erase` and `set_text` delete ink or typed text the way the device eraser and keyboard do: the removed strokes and characters stay in the page as CRDT deletions, and every block the edit does not touch is kept byte for byte. Over SSH the pristine page is backed up to `{pageId}.rm.bak` the first time; the cloud keeps no such copy. A highlight anchored to replaced text loses its anchor.
 - **SSH work is fair and serialized per server** — one FIFO dispatcher owns every SSH subprocess, so startup scans, reads, uploads, mutations, and refresh probes cannot churn the tablet's USB CDC connection concurrently. Cached metadata reads bypass the queue.
 - **Concurrent SSH writes share a refresh barrier** — near-simultaneous writes are persisted in FIFO order, then every participating call waits for one shared `xochitl` restart before reporting success. A bounded debounce coalesces bursts without background or late success.
 - **SSH refreshes avoid the firmware emergency-reboot path** — the serialized refresh clears only `xochitl`'s systemd start counter immediately before restart, then requires stable, non-multiplexed SSH sessions on the same boot. OpenSSH aliases are resolved with `ssh -G`; if USB web was reachable at that effective host before restart, port 80 must recover too. A failed probe keeps `refresh_pending: true` and never replays the write.
@@ -724,9 +726,10 @@ remarkable_upload("a.pdf", parent_folder="/Research", defer_restart=True)
 remarkable_upload("b.pdf", parent_folder="/Research", defer_restart=True)
 remarkable_refresh()
 
-# Author native ink and notebooks (SSH and cloud). In cloud mode the tablet
-# picks each change up on its next sync; draw and add_page only append, so ink
-# or pages another device already synced to the cloud are kept.
+# Author and edit native ink and notebooks (SSH and cloud). In cloud mode the
+# tablet picks each change up on its next sync. Every method rewrites only the
+# page it targets, so ink, text or pages another device already synced to the
+# cloud are kept.
 # Append pen/highlighter strokes to a page (coordinates normalized [0,1] from
 # the page's top-left). The interactive canvas Save button calls this too.
 remarkable_author(
@@ -735,6 +738,16 @@ remarkable_author(
     page=1,
     strokes=[{"points": [[0.1, 0.2], [0.8, 0.2]], "tool": "highlighter", "color": "yellow"}],
 )
+
+# Erase strokes: the whole page's ink, or every stroke crossing a region
+# [x0, y0, x1, y1] (normalized, top-left origin). Typed text is left alone.
+remarkable_author(method="erase", document="Ideas", page=1, region=[0.0, 0.0, 1.0, 0.25])
+remarkable_author(method="erase", document="Ideas", page=2)
+
+# Replace a notebook page's typed text (same line prefixes as create_document);
+# text="" removes it. Ink is kept. Read the page first to edit one line.
+remarkable_author(method="set_text", document="Ideas", page=1, text="# Ideas\n- First\n- Second")
+remarkable_author(method="set_text", document="Ideas", page=1, text="")
 
 # Append a blank, drawable page to the end of a notebook
 remarkable_author(method="add_page", document="Ideas")
