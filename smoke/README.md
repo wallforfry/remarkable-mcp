@@ -64,10 +64,10 @@ the folder. Its HTTP API exposes no folder/move/rename/delete endpoints, so thos
 in that mode (shown as N/A). Local directory mode is strictly read-only (the
 folder is the desktop app's private sync cache), so no write tool registers
 there. `remarkable_author` is exposed over SSH and cloud, and the harness runs
-`create_document`, `add_page` and `draw` on a throwaway notebook in both. In
-cloud mode the notebook is seeded with a known marker and read back with
-`remarkable_read` after `add_page` and `draw`, so the row also shows the first
-page's text survived both appends.
+`create_document`, `add_page`, `draw`, `erase` and `set_text` on a throwaway
+notebook in both. In cloud mode the notebook is seeded with a known marker,
+`set_text` replaces it with a second one, and `remarkable_read` reads the page
+back, so the row also shows the text edit landed on top of both appends.
 
 ### Upload is verified end-to-end (cloud/ssh)
 

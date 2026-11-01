@@ -70,6 +70,8 @@ FIXTURE_PDF = HERE / "fixtures" / "smoke-doc.pdf"
 FIXTURE_MARKER = "reMarkable MCP Smoke Test"
 # Typed text seeded into the cloud-authored notebook and read back the same way.
 AUTHOR_MARKER = "reMarkable MCP Smoke Notebook"
+# Typed text set_text writes over the seed, read back to prove the edit landed.
+AUTHOR_EDIT_MARKER = "reMarkable MCP Smoke Edited"
 SNAP_DIR = HERE / "snapshots"
 USB_HOST = "10.11.99.1"
 
@@ -877,8 +879,8 @@ async def run_write_phase(session, mode, rec, registered):
             nb_name = f"{runid}-nb"
             nb_path = f"{folder_path}/{nb_name}"
             # SSH defers the xochitl restart to the single refresh below. The
-            # cloud seeds a known marker so the read-back after add_page and
-            # draw shows the first page's text survived both appends.
+            # cloud seeds a known marker, then set_text replaces it, so the
+            # read-back shows the page edits landed on top of both appends.
             extra = {"defer_restart": True} if is_ssh else {}
             create_args = {"method": "create_document", "name": nb_name, "folder": folder_path}
             if not is_ssh:
@@ -918,11 +920,35 @@ async def run_write_phase(session, mode, rec, registered):
                     TIMEOUTS["remarkable_author"],
                 )
                 dr_state, _ = classify_ok(dr_payload, dr_err, dr_exc)
-                sub = f"create_document=PASS; add_page={ap_state}; draw={dr_state}"
-                final = PASS if (ap_state == PASS and dr_state == PASS) else FAIL
+                er_payload, er_err, er_exc = await call_tool(
+                    session,
+                    "remarkable_author",
+                    {"method": "erase", "document": nb_path, "page": 1, **extra},
+                    TIMEOUTS["remarkable_author"],
+                )
+                er_state, _ = classify_ok(er_payload, er_err, er_exc)
+                st_payload, st_err, st_exc = await call_tool(
+                    session,
+                    "remarkable_author",
+                    {
+                        "method": "set_text",
+                        "document": nb_path,
+                        "page": 1,
+                        "text": AUTHOR_EDIT_MARKER,
+                        **extra,
+                    },
+                    TIMEOUTS["remarkable_author"],
+                )
+                st_state, _ = classify_ok(st_payload, st_err, st_exc)
+                sub = (
+                    f"create_document=PASS; add_page={ap_state}; draw={dr_state}; "
+                    f"erase={er_state}; set_text={st_state}"
+                )
+                states = (ap_state, dr_state, er_state, st_state)
+                final = PASS if all(s == PASS for s in states) else FAIL
                 if not is_ssh:
                     ok, rt_note = await verify_read_roundtrip(
-                        session, nb_path, AUTHOR_MARKER, "text"
+                        session, nb_path, AUTHOR_EDIT_MARKER, "text"
                     )
                     sub += f"; {rt_note}"
                     if not ok:
