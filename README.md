@@ -9,7 +9,7 @@ OpenWebUI, and other compatible tools.
 
 - Browse folders and recent documents.
 - Search names, tags, and extracted text.
-- Read typed text, PDF and EPUB text, highlights, and annotations.
+- Read typed text (with Markdown prefixes for its paragraph styles), PDF and EPUB text, highlights, and annotations.
 - Render notebooks and annotated PDFs as PNG or SVG.
 - Export one document as a complete PDF or sectioned Markdown resource.
 - Run handwriting OCR through Google Vision or Tesseract.
