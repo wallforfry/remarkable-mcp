@@ -328,6 +328,22 @@ def _ocr_png_google_vision(png_path: Path) -> Optional[str]:
     return None
 
 
+def _typed_text_parts(content: dict) -> list[str]:
+    """Return the typed text of an extraction, one part per page under a header.
+
+    Read output separates parts with a blank line, so each page's lines are
+    joined into one part: the page then reads back exactly as set_text takes
+    it. ``typed_text`` starts with the lines of ``typed_pages`` in page order;
+    what follows them came from no page (.txt, .md or .content text) and is
+    listed after the pages.
+    """
+    typed_pages = content.get("typed_pages") or []
+    typed_text = content.get("typed_text") or []
+    parts = ["\n".join([f"--- Page {typed['page']} ---", *typed["lines"]]) for typed in typed_pages]
+    parts.extend(typed_text[sum(len(typed["lines"]) for typed in typed_pages) :])
+    return parts
+
+
 @mcp.tool(annotations=READ_ANNOTATIONS)
 async def remarkable_read(
     document: str,
@@ -348,9 +364,12 @@ async def remarkable_read(
       may not be synced to the cloud).
     - "annotations": Only annotations, highlights, and handwritten notes
 
-    Typed text keeps the Markdown line prefix of each paragraph style ("# "
-    title, "## " heading, "- " bullet, "- [x] " checked box, "1. " numbered
-    item...), the same prefixes remarkable_author accepts.
+    Typed text is grouped under a "--- Page N ---" header per page, N being
+    the page number remarkable_author takes. Each line keeps the Markdown
+    prefix of its paragraph style ("# " title, "## " heading, "- " bullet,
+    "- [x] " checked box, "1. " numbered item...), the same prefixes
+    remarkable_author accepts, so a page's lines can be edited and sent back
+    with remarkable_author(method="set_text", document=..., page=N, text=...).
 
     Use pagination to read large documents without overwhelming context:
     - Start with page=1 (default)
@@ -597,9 +616,7 @@ async def remarkable_read(
                             tmp_path.unlink(missing_ok=True)
 
                 # Add annotations section
-                annotation_parts = []
-                if content.get("typed_text"):
-                    annotation_parts.extend(content["typed_text"])
+                annotation_parts = _typed_text_parts(content)
                 # Per-page index of highlights / handwritten notes: surfaces only
                 # the annotated pages (and their highlighted text) so the reader
                 # need not page through the whole document to find them.

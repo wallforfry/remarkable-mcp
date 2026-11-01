@@ -91,3 +91,88 @@ class TestExtractTypedText:
         path.write_bytes(nb.page_rm_bytes(text))
 
         assert extract_text_from_rm_file(path) == expected
+
+
+class TestTypedTextPerPage:
+    def _zip(self, tmp_path):
+        import json
+        import zipfile
+
+        path = tmp_path / "doc.zip"
+        with zipfile.ZipFile(path, "w") as zf:
+            pages = [{"id": "p1"}, {"id": "p2"}, {"id": "p3"}]
+            zf.writestr("doc.content", json.dumps({"cPages": {"pages": pages}}))
+            zf.writestr("doc/p3.rm", nb.page_rm_bytes("# Third\n- item"))
+            zf.writestr("doc/p1.rm", nb.page_rm_bytes("First"))
+            zf.writestr("doc/p2.rm", nb.page_rm_bytes(""))
+        return path
+
+    def test_extraction_keeps_page_numbers(self, tmp_path):
+        from remarkable_mcp.extract import extract_text_from_document_zip
+
+        result = extract_text_from_document_zip(self._zip(tmp_path))
+
+        assert result["typed_pages"] == [
+            {"page": 1, "page_id": "p1", "lines": ["First"]},
+            {"page": 3, "page_id": "p3", "lines": ["# Third", "- item"]},
+        ]
+        assert result["typed_text"] == ["First", "# Third", "- item"]
+
+    def test_read_groups_typed_text_under_page_headers(self):
+        from remarkable_mcp.tools import _typed_text_parts
+
+        content = {
+            "typed_pages": [
+                {"page": 2, "page_id": "p2", "lines": ["# Plan", "", "- Ship"]},
+                {"page": 5, "page_id": "p5", "lines": ["Later"]},
+            ],
+            "typed_text": ["# Plan", "", "- Ship", "Later", "from a .txt file"],
+        }
+
+        assert _typed_text_parts(content) == [
+            "--- Page 2 ---\n# Plan\n\n- Ship",
+            "--- Page 5 ---\nLater",
+            "from a .txt file",
+        ]
+
+    def test_read_without_page_split_keeps_flat_text(self):
+        from remarkable_mcp.tools import _typed_text_parts
+
+        assert _typed_text_parts({"typed_text": ["a", "b"]}) == ["a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_remarkable_read_shows_page_headers(self, tmp_path):
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        from remarkable_mcp import tools
+        from remarkable_mcp.extract import extract_text_from_document_zip
+        from remarkable_mcp.server import mcp
+
+        doc = SimpleNamespace(
+            VissibleName="Notes",
+            ID="doc",
+            Parent="",
+            ModifiedClient=None,
+            is_folder=False,
+            tags=[],
+        )
+        client = Mock()
+        client.get_meta_items.return_value = [doc]
+        client.download.return_value = self._zip(tmp_path).read_bytes()
+
+        with (
+            patch.object(tools, "get_rmapi", return_value=client),
+            patch.object(tools, "get_file_type", return_value="notebook"),
+            patch.object(tools, "get_cached_ocr_result", return_value=None),
+            patch.object(
+                tools,
+                "extract_text_from_document_zip",
+                lambda path, **_: extract_text_from_document_zip(path),
+            ),
+        ):
+            result = await mcp.call_tool("remarkable_read", {"document": "Notes"})
+
+        content = json.loads(result.content[0].text)["content"]
+        assert content == "--- Page 1 ---\nFirst\n\n--- Page 3 ---\n# Third\n- item"

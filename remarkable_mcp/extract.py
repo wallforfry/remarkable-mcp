@@ -2025,6 +2025,11 @@ def extract_text_from_document_zip(
     Returns:
         {
             "typed_text": [...],      # From rmscene parsing (list of strings)
+            "typed_pages": [           # The rmscene part of typed_text, per page
+                {"page": int,          # 1-based page number
+                 "page_id": str,
+                 "lines": [str]},      # paragraphs with style prefixes
+            ],
             "highlights": [...],       # Highlighted text (GlyphRange + legacy JSON)
             "handwritten_text": [...], # From OCR (if enabled) - one per page, in order
             "pages": int,
@@ -2051,6 +2056,7 @@ def extract_text_from_document_zip(
 
     result: Dict[str, Any] = {
         "typed_text": [],
+        "typed_pages": [],
         "highlights": [],
         "handwritten_text": None,
         "pages": 0,
@@ -2108,17 +2114,28 @@ def extract_text_from_document_zip(
 
         result["pages"] = len(page_order) or len(rm_files)
 
-        # Extract typed text from .rm files using rmscene
-        for rm_file in rm_files:
+        page_pos = {pid: i for i, pid in enumerate(page_order)}
+
+        # Extract typed text from .rm files using rmscene, per real page number
+        # so a reader can edit one page's text with remarkable_author set_text.
+        for order_pos, rm_file in enumerate(rm_files):
             text_lines = extract_text_from_rm_file(rm_file)
+            if text_lines:
+                result["typed_pages"].append(
+                    {
+                        "page": page_pos.get(rm_file.stem, order_pos) + 1,
+                        "page_id": rm_file.stem,
+                        "lines": text_lines,
+                    }
+                )
             result["typed_text"].extend(text_lines)
+        result["typed_pages"].sort(key=lambda t: t["page"])
 
         # Extract per-page text highlights (GlyphRange items) and note-presence
         # from the .rm files, indexed by real page number. This powers "show only
         # the annotated pages / the highlighted text" without paging through the
         # whole document. (The legacy .highlights JSON scanned below only covers
         # older firmware exports.)
-        page_pos = {pid: i for i, pid in enumerate(page_order)}
         for order_pos, rm_file in enumerate(rm_files):
             page_num = page_pos.get(rm_file.stem, order_pos) + 1
             page_highlights, has_strokes = _extract_page_annotations(rm_file)
