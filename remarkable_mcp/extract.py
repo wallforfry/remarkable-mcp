@@ -648,6 +648,16 @@ def _v6_group_offsets(blocks: list, anchor_pos: dict) -> dict:
     return offsets
 
 
+def ink_group_offsets(blocks: list) -> dict:
+    """Map each ink group to the ``(dx, dy)`` page translation the renderer applies.
+
+    Groups anchored to typed text store their ink relative to the anchor; the
+    offsets come from the same text layout estimate the canvas renders with.
+    """
+    _, _, anchor_pos = _v6_text_elements_with_bounds(blocks)
+    return _v6_group_offsets(blocks, anchor_pos)
+
+
 def _v6_paths_from_blocks(blocks: list, anchor_pos: Optional[dict] = None) -> Tuple[list, list]:
     """Build SVG ``<path>`` strings + a flat coordinate list from v6 blocks.
 

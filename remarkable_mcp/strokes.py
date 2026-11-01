@@ -44,15 +44,18 @@ import logging
 from typing import Iterable, Optional
 
 from rmscene import HEADER_V6, read_blocks, write_blocks
-from rmscene.scene_items import Line, Pen, PenColor, Point
+from rmscene.scene_items import Line, Pen, PenColor, Point, Text
 from rmscene.scene_stream import (
     CrdtSequenceItem,
+    RootTextBlock,
     SceneGroupItemBlock,
     SceneInfo,
     SceneLineItemBlock,
     TreeNodeBlock,
 )
 from rmscene.tagged_block_common import CrdtId
+
+from remarkable_mcp.text_diff import item_span
 
 logger = logging.getLogger(__name__)
 
@@ -190,8 +193,31 @@ def get_paper_size(blocks: Iterable[object]) -> tuple[int, int]:
     return DEFAULT_PAPER_SIZE
 
 
+_GROUP_LWW_FIELDS = (
+    "label",
+    "visible",
+    "anchor_id",
+    "anchor_type",
+    "anchor_threshold",
+    "anchor_origin_x",
+)
+
+
+def _text_crdt_ids(text: Text):
+    """Yield the last character id of every text item and every style stamp."""
+    for item in text.items.sequence_items():
+        span = max(item_span(item), 1)
+        yield CrdtId(item.item_id.part1, item.item_id.part2 + span - 1)
+    for value in text.styles.values():
+        yield value.timestamp
+
+
 def _iter_crdt_ids(blocks: Iterable[object]):
-    """Yield every CrdtId referenced by a block list (best effort)."""
+    """Yield every CrdtId referenced by a block list (best effort).
+
+    Typed text characters and last-writer-wins stamps draw from the same
+    per-author counter as scene items, so they are included.
+    """
     for b in blocks:
         for attr in ("tree_id", "node_id", "parent_id", "block_id"):
             v = getattr(b, attr, None)
@@ -210,6 +236,17 @@ def _iter_crdt_ids(blocks: Iterable[object]):
             gid = getattr(group, "node_id", None)
             if isinstance(gid, CrdtId):
                 yield gid
+            for field in _GROUP_LWW_FIELDS:
+                stamp = getattr(getattr(group, field, None), "timestamp", None)
+                if isinstance(stamp, CrdtId):
+                    yield stamp
+        if isinstance(b, RootTextBlock):
+            yield from _text_crdt_ids(b.value)
+
+
+def max_crdt_id(blocks: list) -> CrdtId:
+    """Return the highest CrdtId on a page, or ``CrdtId(0, 0)`` for an empty one."""
+    return max(_iter_crdt_ids(blocks), key=lambda cid: (cid.part1, cid.part2), default=CrdtId(0, 0))
 
 
 def find_target_layer(blocks: list) -> CrdtId:
@@ -222,23 +259,36 @@ def find_target_layer(blocks: list) -> CrdtId:
          ``SceneGroupItemBlock`` — these parent the visible layers under root.
       3. The ``node_id`` of the last labeled ``TreeNodeBlock`` (a layer group).
 
+    Groups anchored to typed text are skipped at every step: the device stores
+    their ink relative to the anchor (handwriting over text, or below it), so
+    page coordinates written into one would land offset by that anchor.
+
     Raises StrokeError with actionable guidance if no layer can be found, rather
     than guessing a hardcoded id that only happens to work on one device.
     """
+    anchored = {
+        b.group.node_id
+        for b in blocks
+        if isinstance(b, TreeNodeBlock) and getattr(b.group, "anchor_id", None) is not None
+    }
     for b in reversed(blocks):
-        if isinstance(b, SceneLineItemBlock) and isinstance(b.parent_id, CrdtId):
+        if (
+            isinstance(b, SceneLineItemBlock)
+            and isinstance(b.parent_id, CrdtId)
+            and b.parent_id not in anchored
+        ):
             return b.parent_id
     for b in reversed(blocks):
         if isinstance(b, SceneGroupItemBlock):
             val = getattr(b.item, "value", None)
-            if isinstance(val, CrdtId):
+            if isinstance(val, CrdtId) and val not in anchored:
                 return val
     for b in reversed(blocks):
         if isinstance(b, TreeNodeBlock):
             group = getattr(b, "group", None)
             node_id = getattr(group, "node_id", None)
             label = getattr(group, "label", None)
-            if isinstance(node_id, CrdtId) and label is not None:
+            if isinstance(node_id, CrdtId) and label is not None and node_id not in anchored:
                 return node_id
     raise StrokeError(
         "Could not find a layer to draw on in this page. The .rm file may be "
@@ -253,10 +303,7 @@ def allocate_ids(blocks: list, count: int) -> list[CrdtId]:
     Picks an id strictly greater (by ``part2``) than anything already present so
     the new sequence items never collide with existing content.
     """
-    max_id = CrdtId(0, 0)
-    for cid in _iter_crdt_ids(blocks):
-        if (cid.part1, cid.part2) > (max_id.part1, max_id.part2):
-            max_id = cid
+    max_id = max_crdt_id(blocks)
     part1 = max_id.part1 if max_id.part1 else 0
     base = max_id.part2
     return [CrdtId(part1, base + 1 + i) for i in range(count)]

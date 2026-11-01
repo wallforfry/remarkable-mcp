@@ -35,7 +35,8 @@ from rmscene.scene_stream import (
 from rmscene.tagged_block_common import CrdtId
 
 from remarkable_mcp import strokes as strokes_mod
-from remarkable_mcp.text_diff import TextEdit, edit_text, item_span
+from remarkable_mcp.extract import ink_group_offsets
+from remarkable_mcp.text_diff import TextEdit, edit_text
 from remarkable_mcp.text_styles import StyledRootTextBlock
 
 # uint32 body length, then unknown, min version, current version, block type.
@@ -88,11 +89,12 @@ def _region_bounds(region: Optional[list], paper_w: int, paper_h: int) -> Option
     return ((x0 - 0.5) * paper_w, y0 * paper_h, (x1 - 0.5) * paper_w, y1 * paper_h)
 
 
-def _stroke_hit(line, bounds: Optional[tuple]) -> bool:
+def _stroke_hit(line, offset: tuple, bounds: Optional[tuple]) -> bool:
     if bounds is None:
         return True
     x0, y0, x1, y1 = bounds
-    return any(x0 <= p.x <= x1 and y0 <= p.y <= y1 for p in line.points)
+    dx, dy = offset
+    return any(x0 <= p.x + dx <= x1 and y0 <= p.y + dy <= y1 for p in line.points)
 
 
 def erase_strokes(original_bytes: bytes, region: Optional[list] = None) -> tuple[bytes, int]:
@@ -101,13 +103,15 @@ def erase_strokes(original_bytes: bytes, region: Optional[list] = None) -> tuple
     With no ``region`` every stroke is erased. Otherwise a stroke is erased
     when any of its points falls inside the normalised top-left
     ``[x0, y0, x1, y1]`` rectangle, like the device eraser sweeping that area.
-    Typed text is left alone. The input bytes come back unchanged when nothing
+    Ink anchored to typed text is placed where the canvas renders it before
+    the test. Typed text is left alone. The input bytes come back unchanged when nothing
     matches.
     """
     segments = _split_blocks(original_bytes)
     blocks = [_parse_block(segment) for segment in segments]
     paper_w, paper_h = strokes_mod.get_paper_size(blocks)
     bounds = _region_bounds(region, paper_w, paper_h)
+    offsets = ink_group_offsets(blocks) if bounds is not None else {}
 
     edited = []
     erased = 0
@@ -115,7 +119,7 @@ def erase_strokes(original_bytes: bytes, region: Optional[list] = None) -> tuple
         if (
             isinstance(block, SceneLineItemBlock)
             and block.item.value is not None
-            and _stroke_hit(block.item.value, bounds)
+            and _stroke_hit(block.item.value, offsets.get(block.parent_id, (0.0, 0.0)), bounds)
         ):
             tombstone = SceneTombstoneItemBlock(
                 parent_id=block.parent_id,
@@ -128,18 +132,6 @@ def erase_strokes(original_bytes: bytes, region: Optional[list] = None) -> tuple
     if not erased:
         return original_bytes, 0
     return HEADER_V6 + b"".join(edited), erased
-
-
-def _max_crdt_id(blocks: list, text: Optional[Text]) -> CrdtId:
-    """Return the highest id on the page, text characters and style stamps included."""
-    ids = list(strokes_mod._iter_crdt_ids(blocks))
-    if text is not None:
-        ids += [
-            CrdtId(item.item_id.part1, item.item_id.part2 + max(item_span(item), 1) - 1)
-            for item in text.items.sequence_items()
-        ]
-        ids += [value.timestamp for value in text.styles.values()]
-    return max(ids, key=lambda cid: (cid.part1, cid.part2), default=_END_MARKER)
 
 
 def _root_text(blocks: list) -> Optional[int]:
@@ -203,7 +195,7 @@ def set_page_text(original_bytes: bytes, text: str) -> tuple[bytes, int]:
 
     old_block = blocks[root_index] if root_index is not None else None
     old_text = old_block.value if old_block is not None else None
-    edit = edit_text(old_text, text, _max_crdt_id(blocks, old_text))
+    edit = edit_text(old_text, text, strokes_mod.max_crdt_id(blocks))
     new_segment = _serialize_block(_replacement_text_block(old_block, edit))
 
     if root_index is not None:

@@ -355,3 +355,36 @@ class TestMalformedPages:
             page_edit.erase_strokes(data)
         with pytest.raises(page_edit.PageEditError):
             page_edit.set_page_text(data, "x")
+
+
+class TestAnchoredInkCoordinates:
+    """Ink anchored to text is stored relative to its anchor, as the device writes it."""
+
+    def test_new_strokes_skip_anchored_groups(self):
+        page, _ = _anchored_page()
+
+        drawn = strokes_mod.append_strokes(page, [_TOP_LEFT])
+
+        [new] = [b for b in _blocks(drawn)[len(_blocks(page)) :]]
+        assert new.parent_id == CrdtId(0, 11)
+
+    def test_erase_region_matches_the_rendered_position(self):
+        from remarkable_mcp.extract import ink_group_offsets
+
+        page, _ = _anchored_page()
+        _, dy = ink_group_offsets(_blocks(page))[CrdtId(0, 900)]
+        # The anchored stroke is stored at y=10, rendered at y=10 + dy.
+        rendered = (10 + dy) / 1872
+
+        assert page_edit.erase_strokes(page, [0.4, 0.0, 0.6, 0.02])[1] == 0
+        assert page_edit.erase_strokes(page, [0.4, rendered - 0.01, 0.6, rendered + 0.01])[1] == 1
+
+    def test_strokes_after_a_text_edit_get_unused_ids(self):
+        page, _ = page_edit.set_page_text(_page(), "Agenda\nInserted\nFollow-ups")
+        text_ids = set(strokes_mod._text_crdt_ids(_root_text(page)))
+
+        drawn = strokes_mod.append_strokes(page, [_TOP_LEFT, _BOTTOM_RIGHT])
+
+        new_ids = {b.item.item_id for b in _blocks(drawn)[len(_blocks(page)) :]}
+        assert len(new_ids) == 2
+        assert min(i.part2 for i in new_ids) > max(i.part2 for i in text_ids)
