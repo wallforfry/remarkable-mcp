@@ -816,8 +816,11 @@ def _v6_text_svg_elements(blocks: list) -> list:
 
 
 # Special anchor CrdtIds the device uses for ink groups pinned to the page
-# itself rather than to a typed character: (0, 281474976710654) anchors at the
-# top of the text block, (0, 281474976710655) below its last line.
+# itself rather than to a typed character: (0, 281474976710654) before the
+# text, (0, 281474976710655) after it. Despite the names, a Paper Pro stores
+# ink under either one relative to the text block's top, not to its last line:
+# a stroke drawn at the page's bottom edge under four lines of text was stored
+# at y ~1670, which lands on the edge only with the top-of-text offset.
 _ANCHOR_TEXT_TOP = (0, 281474976710654)
 _ANCHOR_TEXT_BOTTOM = (0, 281474976710655)
 
@@ -829,8 +832,8 @@ def _v6_text_elements_with_bounds(blocks: list) -> Tuple[list, list, dict]:
     ``(x, y)`` extent points (in the page's stroke/screen units, center-origin
     X) so a content-cropped render can size its viewBox to include the text.
     ``anchor_pos`` maps text-character ``CrdtId``s (plus the special
-    top/bottom-of-text ids) to the page-space Y of the line holding that
-    character: ink groups anchored to a character must be translated by that Y
+    top/bottom-of-text ids) to the page-space baseline Y of the line holding
+    that character: ink groups anchored to a character must be translated by that Y
     (see :func:`_v6_paths_from_blocks`), which is how the device keeps
     handwriting positioned relative to text as the typed block reflows.
     Returns ``([], [], {})`` when the page has no typed text (the common case
@@ -892,20 +895,21 @@ def _v6_text_elements_with_bounds(blocks: list) -> Tuple[list, list, dict]:
     anchor_pos: dict = {}
     y_offset = _TEXT_TOP_Y * scale
     anchor_pos[CrdtId(*_ANCHOR_TEXT_TOP)] = pos_y + y_offset
+    anchor_pos[CrdtId(*_ANCHOR_TEXT_BOTTOM)] = pos_y + y_offset
     for para in doc.contents:
         style = para.style.value if getattr(para, "style", None) is not None else None
         line_height = line_heights.get(style, _TEXT_DEFAULT_LINE_HEIGHT) * scale
         size = font_sizes.get(style, _TEXT_DEFAULT_FONT_SIZE) * scale
         text = str(para).strip()
-        # Every character in this paragraph anchors ink at the paragraph's own
-        # Y (the running offset before this paragraph consumes its lines), the
-        # same reference point the device and the rmc exporter use.
-        para_anchor_y = pos_y + y_offset
+        # The device anchors ink at the baseline of the line holding the
+        # character. ``start_id`` is the newline ending the previous line, so
+        # it takes that line's baseline; this paragraph's characters take the
+        # baseline of its first line (wrapped continuation lines are ignored).
         try:
-            anchor_pos[para.start_id] = para_anchor_y
+            anchor_pos[para.start_id] = pos_y + y_offset
             for subpara in para.contents:
                 for char_id in getattr(subpara, "i", []) or []:
-                    anchor_pos[char_id] = para_anchor_y
+                    anchor_pos[char_id] = pos_y + y_offset + line_height
         except Exception:
             pass
         if not text:
@@ -932,7 +936,6 @@ def _v6_text_elements_with_bounds(blocks: list) -> Tuple[list, list, dict]:
                 est_width = min(est_width, box_width)
             coords.append((pos_x, baseline - size))
             coords.append((pos_x + est_width, baseline + size * 0.3))
-    anchor_pos[CrdtId(*_ANCHOR_TEXT_BOTTOM)] = pos_y + y_offset
     return elements, coords, anchor_pos
 
 

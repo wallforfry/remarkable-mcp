@@ -9567,12 +9567,13 @@ class TestTextAnchoredInk:
         elements, _, anchor_pos = _v6_text_elements_with_bounds(self._blocks(data))
 
         assert elements, "typed text should render"
-        assert anchor_char in anchor_pos
+        second_baseline = float(elements[1].split('y="')[1].split('"')[0])
+        # Measured on a Paper Pro: a character anchors at its own line's
+        # baseline, and both special markers at the top of the text block.
+        assert anchor_pos[anchor_char] == second_baseline
         top = anchor_pos[CrdtId(*_ANCHOR_TEXT_TOP)]
-        bottom = anchor_pos[CrdtId(*_ANCHOR_TEXT_BOTTOM)]
-        # The second paragraph's characters anchor strictly between the top of
-        # the text block and below its last line.
-        assert top < anchor_pos[anchor_char] < bottom
+        assert anchor_pos[CrdtId(*_ANCHOR_TEXT_BOTTOM)] == top
+        assert top < second_baseline
 
     def test_anchored_stroke_is_translated(self):
         from remarkable_mcp.extract import (
